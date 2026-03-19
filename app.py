@@ -2,7 +2,7 @@ import io
 import re
 import zipfile
 import html
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
@@ -30,6 +30,7 @@ DETAIL_COLUMNS = [
 ]
 
 PASTE_COLUMNS = [
+    "file_name",
     "estimate_date",
     "major_category",
     "no",
@@ -42,8 +43,11 @@ PASTE_COLUMNS = [
 
 UNIT_CANDIDATES = {
     "式", "台", "枚", "本", "箇所", "箇", "ｍ", "m", "m2", "㎡", "㎥",
-    "日", "セット", "ｾｯﾄ", "人工", "個", "ヶ所", "箱", "巻", "丁", "脚", "面"
+    "日", "セット", "ｾｯﾄ", "人工", "個", "ヶ所", "箱", "巻", "丁", "脚", "面",
+    "缶"
 }
+
+HEADER_KEYWORDS = ["NO.", "項目", "仕様・規格/型番", "数量", "単位", "単価", "金額"]
 
 DATE_PATTERNS = [
     re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日"),
@@ -51,88 +55,17 @@ DATE_PATTERNS = [
     re.compile(r"(20\d{2})\.(\d{1,2})\.(\d{1,2})"),
 ]
 
-HEADER_LINE_PATTERN = re.compile(r"NO\.\s+項目\s+仕様・規格/型番\s+数量\s+単位\s+単価\s+金額")
-SUBCATEGORY_PATTERN = re.compile(r"^\d*\s*[\-－ー].+[\-－ー]$")
-LINE_PARSE_PATTERN = re.compile(
-    r"^(?P<no>\d+)\s+(?P<left>.+?)\s+(?P<qty>-?\d+(?:\.\d+)?)\s+"
-    r"(?P<unit>\S+)\s+(?P<unit_price>-?[\d,]+)\s+(?P<amount>-?[\d,]+)$"
-)
+SUBCATEGORY_PATTERN = re.compile(r"^\d*\s*[\-－ー【\[].+[\-－ー】\]]\s*$")
+ONLY_NUMBER_PATTERN = re.compile(r"^\d+$")
+MONEY_TOKEN_PATTERN = re.compile(r"^\(?¥?-?[\d,]+\)?$")
 
 
 def clean_text(text: str) -> str:
-    text = str(text or "").replace("\u3000", " ")
+    text = str(text or "")
+    text = text.replace("\u3000", " ")
+    text = text.replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
-
-
-def extract_estimate_date_from_text(text: str) -> str:
-    text = text or ""
-
-    # まず「見積作成日」付近を優先
-    priority_lines = []
-    for line in text.splitlines():
-        t = clean_text(line)
-        if "見積作成日" in t or ("見積" in t and "日" in t):
-            priority_lines.append(t)
-
-    for line in priority_lines:
-        for pattern in DATE_PATTERNS:
-            m = pattern.search(line)
-            if m:
-                y, mn, d = m.groups()
-                return f"{y}-{int(mn):02d}-{int(d):02d}"
-
-    # 見つからなければ先頭2ページから一般日付を拾う
-    for pattern in DATE_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            y, mn, d = m.groups()
-            return f"{y}-{int(mn):02d}-{int(d):02d}"
-
-    return ""
-
-
-def extract_estimate_date(pdf) -> str:
-    text_parts = []
-    for page in pdf.pages[:2]:
-        page_text = page.extract_text() or ""
-        text_parts.append(page_text)
-    return extract_estimate_date_from_text("\n".join(text_parts))
-
-
-def is_header_line(text: str) -> bool:
-    t = clean_text(text)
-    if not t:
-        return False
-    if HEADER_LINE_PATTERN.search(t):
-        return True
-    return all(k in t for k in ["NO.", "項目", "数量", "単位", "単価", "金額"])
-
-
-def looks_like_detail_line(text: str) -> bool:
-    t = clean_text(text)
-    if not t:
-        return False
-    return LINE_PARSE_PATTERN.match(t) is not None
-
-
-def is_detail_page(text: str) -> bool:
-    lines = [clean_text(x) for x in (text or "").splitlines() if clean_text(x)]
-    if not lines:
-        return False
-
-    header_found = any(is_header_line(line) for line in lines)
-    detail_like_count = sum(1 for line in lines if looks_like_detail_line(line))
-
-    # 明細ヘッダーがあり、明細らしい行が2件以上あれば明細ページ
-    if header_found and detail_like_count >= 2:
-        return True
-
-    # ヘッダーがなくても、明細らしい行が多ければ明細ページ
-    if detail_like_count >= 4:
-        return True
-
-    return False
 
 
 def normalize_major_category(text: str) -> str:
@@ -142,99 +75,140 @@ def normalize_major_category(text: str) -> str:
     return t.strip()
 
 
-def detect_major_category(lines: List[str]) -> str:
+def normalize_date_str(text: str) -> str:
+    t = clean_text(text)
+    for pattern in DATE_PATTERNS:
+        m = pattern.search(t)
+        if m:
+            y, mn, d = m.groups()
+            return f"{y}-{int(mn):02d}-{int(d):02d}"
+    return ""
+
+
+def extract_estimate_date(pdf) -> str:
     candidates = []
-    for line in lines[:8]:
-        t = clean_text(line)
-        if not t:
-            continue
-        if is_header_line(t):
-            continue
-        if "小計" in t or "小 計" in t:
-            continue
-        if t in {"御 見 積 書", "E S T I M A T E"}:
-            continue
-        if re.match(r"^\d+\s+.+\s+\d+(?:\.\d+)?\s+\S+\s+-?[\d,]+\s+-?[\d,]+$", t):
-            continue
-        if "工事" in t and len(t) <= 30:
-            candidates.append(t)
 
-    if not candidates:
-        return ""
+    for page in pdf.pages[:2]:
+        text = page.extract_text() or ""
+        for line in text.splitlines():
+            t = clean_text(line)
+            if not t:
+                continue
+            if "見積作成日" in t:
+                d = normalize_date_str(t)
+                if d:
+                    return d
+            d = normalize_date_str(t)
+            if d:
+                candidates.append(d)
 
-    return normalize_major_category(candidates[0])
+    return candidates[0] if candidates else ""
 
 
-def is_excluded_raw_line(text: str) -> bool:
+def normalize_money_token(text: str) -> str:
     t = clean_text(text)
     if not t:
+        return ""
+
+    t = t.replace("¥", "")
+    t = t.replace("￥", "")
+    t = t.replace(" ", "")
+
+    if t.startswith("(") and t.endswith(")"):
+        inner = t[1:-1]
+        if re.fullmatch(r"[\d,]+", inner):
+            return "-" + inner
+
+    return t
+
+
+def is_money_token(text: str) -> bool:
+    t = normalize_money_token(text)
+    return bool(re.fullmatch(r"-?[\d,]+", t))
+
+
+def is_quantity_token(text: str) -> bool:
+    t = clean_text(text).replace(",", "")
+    return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", t))
+
+
+def is_unit_token(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+    if t in UNIT_CANDIDATES:
         return True
-
-    exclude_patterns = [
-        r"^御\s*見\s*積\s*書",
-        r"^E\s*S\s*T\s*I\s*M\s*A\s*T\s*E$",
-        r"^OXY株式会社$",
-        r"^NO\.\s+項目\s+仕様・規格/型番\s+数量\s+単位\s+単価\s+金額$",
-        r"^小\s*計",
-        r"^内消費税",
-        r"^御見積金額",
-        r"^PAGE\.?",
-        r"^\d+$",
-    ]
-    for pattern in exclude_patterns:
-        if re.search(pattern, t):
-            return True
-
+    if re.fullmatch(r"[A-Za-z0-9㎡㎥ｍm/]+", t):
+        return True
     return False
 
 
-def parse_detail_line(line: str) -> Optional[Dict]:
-    t = clean_text(line)
+def is_header_line(text: str) -> bool:
+    t = clean_text(text)
     if not t:
-        return None
+        return False
+    score = sum(1 for k in ["NO.", "項目", "数量", "単位", "単価", "金額"] if k in t)
+    return score >= 4
 
+
+def find_header_index(lines: List[str]) -> Optional[int]:
+    for i, line in enumerate(lines):
+        if is_header_line(line):
+            return i
+    return None
+
+
+def is_subcategory_only(text: str) -> bool:
+    return bool(SUBCATEGORY_PATTERN.match(clean_text(text)))
+
+
+def is_page_title_candidate(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+    if len(t) < 2 or len(t) > 30:
+        return False
     if is_header_line(t):
-        return None
+        return False
+    if ONLY_NUMBER_PATTERN.match(t):
+        return False
+    if is_subcategory_only(t):
+        return False
+    if any(x in t for x in ["御 見 積 書", "E S T I M A T E", "見積作成日", "振 込 先", "工 事 件 名", "工 事 場 所", "お支払い条件", "有効期限", "小計", "小 計"]):
+        return False
+    if re.search(r"(株式会社|有限会社|〒|TEL|FAX|MAIL|登録番号)", t):
+        return False
+    if re.match(r"^\d+\s+", t):
+        return False
+    if is_detail_like_line(t):
+        return False
+    return True
 
-    if "小計" in t or "小 計" in t:
-        return None
 
-    m = LINE_PARSE_PATTERN.match(t)
-    if not m:
-        return {
-            "no": "",
-            "item_spec": "",
-            "quantity": "",
-            "unit": "",
-            "unit_price": "",
-            "amount": "",
-            "raw_row": t,
-            "needs_review": 1,
-        }
+def second_page_has_title_above_header(lines: List[str]) -> Tuple[bool, str]:
+    header_idx = find_header_index(lines)
+    if header_idx is None:
+        return False, ""
 
-    unit = clean_text(m.group("unit"))
-    if unit not in UNIT_CANDIDATES and not re.match(r"^[A-Za-z0-9㎡㎥ｍm/]+$", unit):
-        return {
-            "no": "",
-            "item_spec": "",
-            "quantity": "",
-            "unit": "",
-            "unit_price": "",
-            "amount": "",
-            "raw_row": t,
-            "needs_review": 1,
-        }
+    upper_lines = [clean_text(x) for x in lines[:header_idx] if clean_text(x)]
+    if not upper_lines:
+        return False, ""
 
-    return {
-        "no": clean_text(m.group("no")),
-        "item_spec": clean_text(m.group("left")),
-        "quantity": clean_text(m.group("qty")),
-        "unit": unit,
-        "unit_price": clean_text(m.group("unit_price")),
-        "amount": clean_text(m.group("amount")),
-        "raw_row": t,
-        "needs_review": 0,
-    }
+    candidates = [x for x in upper_lines if is_page_title_candidate(x)]
+    if not candidates:
+        return False, ""
+
+    title = normalize_major_category(candidates[-1])
+    return True, title
+
+
+def should_skip_first_page(pdf) -> bool:
+    if len(pdf.pages) < 2:
+        return False
+
+    second_page_lines = extract_lines_from_page(pdf.pages[1])
+    has_title, _ = second_page_has_title_above_header(second_page_lines)
+    return has_title
 
 
 def extract_lines_from_page(page) -> List[str]:
@@ -249,13 +223,26 @@ def extract_lines_from_page(page) -> List[str]:
         page_text = page.extract_text() or ""
         return [clean_text(x) for x in page_text.splitlines() if clean_text(x)]
 
-    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+    footer_cutoff = page.height - 28
+    usable_words = []
+    for w in words:
+        txt = clean_text(w.get("text", ""))
+        if not txt:
+            continue
+        top = float(w["top"])
+        bottom = float(w["bottom"])
+        if top >= footer_cutoff or bottom >= footer_cutoff:
+            continue
+        usable_words.append(w)
+
+    usable_words = sorted(usable_words, key=lambda w: (round(w["top"], 1), w["x0"]))
+
     grouped = []
     current = []
     current_top = None
     tolerance = 3
 
-    for w in words:
+    for w in usable_words:
         top = w["top"]
         if current_top is None:
             current = [w]
@@ -283,19 +270,225 @@ def extract_lines_from_page(page) -> List[str]:
     return lines
 
 
+def detect_major_category(lines: List[str]) -> str:
+    header_idx = find_header_index(lines)
+    if header_idx is not None:
+        upper = [clean_text(x) for x in lines[:header_idx] if clean_text(x)]
+        candidates = [x for x in upper if is_page_title_candidate(x)]
+        if candidates:
+            return normalize_major_category(candidates[-1])
+
+    # ヘッダー上になければページ全体からの簡易救済
+    for line in lines[:8]:
+        t = clean_text(line)
+        if is_page_title_candidate(t):
+            return normalize_major_category(t)
+
+    return ""
+
+
+def is_detail_like_line(text: str) -> bool:
+    t = clean_text(text)
+    parsed = parse_detail_line_core(t)
+    return parsed is not None
+
+
+def parse_detail_line_core(line: str) -> Optional[Dict]:
+    t = clean_text(line)
+    if not t:
+        return None
+
+    # パターン1: no left qty unit unit_price amount
+    m1 = re.match(
+        r"^(?P<no>\d+)\s+(?P<left>.+?)\s+(?P<qty>-?\d+(?:\.\d+)?)\s+"
+        r"(?P<unit>\S+)\s+(?P<unit_price>\(?¥?-?[\d,]+\)?)\s+(?P<amount>\(?¥?-?[\d,]+\)?)$",
+        t
+    )
+    if m1:
+        return {
+            "no": clean_text(m1.group("no")),
+            "item_spec": clean_text(m1.group("left")),
+            "quantity": clean_text(m1.group("qty")),
+            "unit": clean_text(m1.group("unit")),
+            "unit_price": normalize_money_token(m1.group("unit_price")),
+            "amount": normalize_money_token(m1.group("amount")),
+        }
+
+    # パターン2: no left unit qty unit_price amount
+    m2 = re.match(
+        r"^(?P<no>\d+)\s+(?P<left>.+?)\s+(?P<unit>\S+)\s+"
+        r"(?P<qty>-?\d+(?:\.\d+)?)\s+(?P<unit_price>\(?¥?-?[\d,]+\)?)\s+(?P<amount>\(?¥?-?[\d,]+\)?)$",
+        t
+    )
+    if m2:
+        return {
+            "no": clean_text(m2.group("no")),
+            "item_spec": clean_text(m2.group("left")),
+            "quantity": clean_text(m2.group("qty")),
+            "unit": clean_text(m2.group("unit")),
+            "unit_price": normalize_money_token(m2.group("unit_price")),
+            "amount": normalize_money_token(m2.group("amount")),
+        }
+
+    # パターン3: no left amount amount? broken no use
+    return None
+
+
+def parse_detail_line(line: str) -> Optional[Dict]:
+    t = clean_text(line)
+    if not t:
+        return None
+
+    if is_header_line(t):
+        return None
+
+    if any(x in t for x in ["御 見 積 書", "E S T I M A T E", "見積作成日", "振 込 先", "工 事 件 名", "工 事 場 所", "お支払い条件", "有効期限"]):
+        return None
+
+    if "小計" in t or "小 計" in t:
+        return None
+
+    if re.match(r"^PAGE\.", t, flags=re.IGNORECASE):
+        return None
+
+    if ONLY_NUMBER_PATTERN.match(t):
+        return None
+
+    if is_subcategory_only(t):
+        return {
+            "no": "",
+            "item_spec": "",
+            "quantity": "",
+            "unit": "",
+            "unit_price": "",
+            "amount": "",
+            "raw_row": t,
+            "needs_review": 1,
+            "is_subcategory": True,
+        }
+
+    core = parse_detail_line_core(t)
+    if core is None:
+        return {
+            "no": "",
+            "item_spec": "",
+            "quantity": "",
+            "unit": "",
+            "unit_price": "",
+            "amount": "",
+            "raw_row": t,
+            "needs_review": 1,
+            "is_subcategory": False,
+        }
+
+    if not is_quantity_token(core["quantity"]):
+        return {
+            "no": "",
+            "item_spec": "",
+            "quantity": "",
+            "unit": "",
+            "unit_price": "",
+            "amount": "",
+            "raw_row": t,
+            "needs_review": 1,
+            "is_subcategory": False,
+        }
+
+    if not is_unit_token(core["unit"]):
+        return {
+            "no": "",
+            "item_spec": "",
+            "quantity": "",
+            "unit": "",
+            "unit_price": "",
+            "amount": "",
+            "raw_row": t,
+            "needs_review": 1,
+            "is_subcategory": False,
+        }
+
+    if not is_money_token(core["unit_price"]) or not is_money_token(core["amount"]):
+        return {
+            "no": "",
+            "item_spec": "",
+            "quantity": "",
+            "unit": "",
+            "unit_price": "",
+            "amount": "",
+            "raw_row": t,
+            "needs_review": 1,
+            "is_subcategory": False,
+        }
+
+    return {
+        "no": core["no"],
+        "item_spec": core["item_spec"],
+        "quantity": core["quantity"],
+        "unit": core["unit"],
+        "unit_price": core["unit_price"],
+        "amount": core["amount"],
+        "raw_row": t,
+        "needs_review": 0,
+        "is_subcategory": False,
+    }
+
+
+def merge_multiline_details(lines: List[str]) -> List[str]:
+    merged = []
+    i = 0
+
+    while i < len(lines):
+        current = clean_text(lines[i])
+        if not current:
+            i += 1
+            continue
+
+        # 先に通常パースできればそのまま
+        parsed = parse_detail_line_core(current)
+        if parsed is not None:
+            merged.append(current)
+            i += 1
+            continue
+
+        # 次行と結合してパースできるか試す
+        if i + 1 < len(lines):
+            nxt = clean_text(lines[i + 1])
+            combined = clean_text(current + " " + nxt)
+            parsed2 = parse_detail_line_core(combined)
+            if parsed2 is not None:
+                merged.append(combined)
+                i += 2
+                continue
+
+            # 先頭行が no + left だけ、次行に数量以降
+            m_left = re.match(r"^(?P<no>\d+)\s+(?P<left>.+)$", current)
+            if m_left:
+                combined2 = clean_text(current + " " + nxt)
+                parsed3 = parse_detail_line_core(combined2)
+                if parsed3 is not None:
+                    merged.append(combined2)
+                    i += 2
+                    continue
+
+        merged.append(current)
+        i += 1
+
+    return merged
+
+
 def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
     rows = []
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         estimate_date = extract_estimate_date(pdf)
+        skip_first_page = should_skip_first_page(pdf)
 
         for page_num, page in enumerate(pdf.pages, start=1):
-            page_text = page.extract_text() or ""
-            lines = extract_lines_from_page(page)
-
-            if not is_detail_page(page_text):
+            if page_num == 1 and skip_first_page:
                 continue
 
+            lines = extract_lines_from_page(page)
+            lines = merge_multiline_details(lines)
             major_category = detect_major_category(lines)
 
             for line in lines:
@@ -339,11 +532,6 @@ def process_uploaded_file(uploaded_file) -> List[Dict]:
     return all_rows
 
 
-def is_subcategory_only(text: str) -> bool:
-    t = clean_text(text)
-    return bool(SUBCATEGORY_PATTERN.match(t))
-
-
 def is_noise_row(row: pd.Series) -> bool:
     raw = clean_text(row.get("raw_row", ""))
     major = clean_text(row.get("major_category", ""))
@@ -364,20 +552,24 @@ def is_noise_row(row: pd.Series) -> bool:
     if "小計" in raw or "小 計" in raw:
         return True
 
+    if re.match(r"^PAGE\.", raw, flags=re.IGNORECASE):
+        return True
+
     if is_subcategory_only(raw):
         return True
 
     if raw == major and major != "":
         return True
 
-    if re.fullmatch(r"\d+", raw):
+    if ONLY_NUMBER_PATTERN.match(raw):
         return True
 
-    # 解析失敗で、数値列も取れていない行は貼付用から除外
+    if raw in {"御 見 積 書", "E S T I M A T E"}:
+        return True
+
     if needs_review == 1 and not any([qty, unit, unit_price, amount]):
         return True
 
-    # 単文字・破片を除外
     if needs_review == 1 and len(raw) <= 3:
         return True
 
@@ -396,7 +588,6 @@ def make_paste_df(df: pd.DataFrame) -> pd.DataFrame:
 
     temp = temp[~temp.apply(is_noise_row, axis=1)].copy()
 
-    # 明細として成立している行だけ残す
     temp = temp[
         (temp["no"].astype(str).str.strip() != "") &
         (temp["item_spec"].astype(str).str.strip() != "") &
