@@ -9,6 +9,7 @@ import pdfplumber
 import streamlit as st
 import streamlit.components.v1 as components
 
+
 st.set_page_config(page_title="見積抽出ツール", layout="wide")
 st.title("見積抽出ツール")
 st.write("PDFまたはZIPをアップロードして、見積明細を抽出します。")
@@ -44,10 +45,8 @@ PASTE_COLUMNS = [
 UNIT_CANDIDATES = {
     "式", "台", "枚", "本", "箇所", "箇", "ｍ", "m", "m2", "㎡", "㎥",
     "日", "セット", "ｾｯﾄ", "人工", "個", "ヶ所", "箱", "巻", "丁", "脚", "面",
-    "缶"
+    "缶", "脚", "帖", "箇", "室", "ヶ", "双", "組", "箇口",
 }
-
-HEADER_KEYWORDS = ["NO.", "項目", "仕様・規格/型番", "数量", "単位", "単価", "金額"]
 
 DATE_PATTERNS = [
     re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日"),
@@ -55,9 +54,13 @@ DATE_PATTERNS = [
     re.compile(r"(20\d{2})\.(\d{1,2})\.(\d{1,2})"),
 ]
 
-SUBCATEGORY_PATTERN = re.compile(r"^\d*\s*[\-－ー【\[].+[\-－ー】\]]\s*$")
+HEADER_TOKENS = ["NO.", "項目", "仕様・規格/型番", "数量", "単位", "単価", "金額"]
+
+SUBCATEGORY_ONLY_PATTERN = re.compile(r"^\s*(?:\d+\s*)?[\-－ー【\[].+[\-－ー】\]]\s*$")
 ONLY_NUMBER_PATTERN = re.compile(r"^\d+$")
-MONEY_TOKEN_PATTERN = re.compile(r"^\(?¥?-?[\d,]+\)?$")
+LINE_START_NO_PATTERN = re.compile(r"^(?P<no>\d+)\s+(?P<rest>.+)$")
+MONEY_BODY_PATTERN = re.compile(r"-?[\d,]+")
+RAW_MONEY_TOKEN_PATTERN = re.compile(r"^\(?[¥￥]?-?[\d,]+\)?$")
 
 
 def clean_text(text: str) -> str:
@@ -66,13 +69,6 @@ def clean_text(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
-
-
-def normalize_major_category(text: str) -> str:
-    t = clean_text(text)
-    t = re.sub(r"\s*[①②③④⑤⑥⑦⑧⑨⑩]$", "", t)
-    t = re.sub(r"\s*\d+$", "", t)
-    return t.strip()
 
 
 def normalize_date_str(text: str) -> str:
@@ -94,10 +90,12 @@ def extract_estimate_date(pdf) -> str:
             t = clean_text(line)
             if not t:
                 continue
+
             if "見積作成日" in t:
                 d = normalize_date_str(t)
                 if d:
                     return d
+
             d = normalize_date_str(t)
             if d:
                 candidates.append(d)
@@ -105,18 +103,38 @@ def extract_estimate_date(pdf) -> str:
     return candidates[0] if candidates else ""
 
 
+def normalize_major_category(text: str) -> str:
+    t = clean_text(text)
+    t = re.sub(r"\s*[①②③④⑤⑥⑦⑧⑨⑩]$", "", t)
+    t = re.sub(r"\s*\d+$", "", t)
+    return t.strip()
+
+
+def is_header_line(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+    score = sum(1 for token in ["NO.", "項目", "数量", "単位", "単価", "金額"] if token in t)
+    return score >= 4
+
+
+def find_header_index(lines: List[str]) -> Optional[int]:
+    for i, line in enumerate(lines):
+        if is_header_line(line):
+            return i
+    return None
+
+
 def normalize_money_token(text: str) -> str:
     t = clean_text(text)
     if not t:
         return ""
 
-    t = t.replace("¥", "")
-    t = t.replace("￥", "")
-    t = t.replace(" ", "")
+    t = t.replace("¥", "").replace("￥", "").replace(" ", "")
 
     if t.startswith("(") and t.endswith(")"):
         inner = t[1:-1]
-        if re.fullmatch(r"[\d,]+", inner):
+        if MONEY_BODY_PATTERN.fullmatch(inner):
             return "-" + inner
 
     return t
@@ -124,7 +142,7 @@ def normalize_money_token(text: str) -> str:
 
 def is_money_token(text: str) -> bool:
     t = normalize_money_token(text)
-    return bool(re.fullmatch(r"-?[\d,]+", t))
+    return bool(MONEY_BODY_PATTERN.fullmatch(t))
 
 
 def is_quantity_token(text: str) -> bool:
@@ -143,23 +161,21 @@ def is_unit_token(text: str) -> bool:
     return False
 
 
-def is_header_line(text: str) -> bool:
+def is_subcategory_only(text: str) -> bool:
+    return bool(SUBCATEGORY_ONLY_PATTERN.match(clean_text(text)))
+
+
+def looks_like_cover_noise(text: str) -> bool:
     t = clean_text(text)
     if not t:
-        return False
-    score = sum(1 for k in ["NO.", "項目", "数量", "単位", "単価", "金額"] if k in t)
-    return score >= 4
+        return True
 
-
-def find_header_index(lines: List[str]) -> Optional[int]:
-    for i, line in enumerate(lines):
-        if is_header_line(line):
-            return i
-    return None
-
-
-def is_subcategory_only(text: str) -> bool:
-    return bool(SUBCATEGORY_PATTERN.match(clean_text(text)))
+    cover_keywords = [
+        "御 見 積 書", "E S T I M A T E", "見積作成日", "振 込 先", "工 事 件 名", "工 事 場 所",
+        "お支払い条件", "有効期限", "代表取締役", "登録番号", "MAIL.", "TEL", "FAX", "〒",
+        "株式会社", "有限会社", "御中"
+    ]
+    return any(k in t for k in cover_keywords)
 
 
 def is_page_title_candidate(text: str) -> bool:
@@ -172,15 +188,19 @@ def is_page_title_candidate(text: str) -> bool:
         return False
     if ONLY_NUMBER_PATTERN.match(t):
         return False
-    if is_subcategory_only(t):
+    if looks_like_cover_noise(t):
         return False
-    if any(x in t for x in ["御 見 積 書", "E S T I M A T E", "見積作成日", "振 込 先", "工 事 件 名", "工 事 場 所", "お支払い条件", "有効期限", "小計", "小 計"]):
+    if "小計" in t or "小 計" in t:
         return False
-    if re.search(r"(株式会社|有限会社|〒|TEL|FAX|MAIL|登録番号)", t):
+    if RAW_MONEY_TOKEN_PATTERN.match(t):
+        return False
+    if t.startswith("¥") or t.startswith("￥"):
+        return False
+    if re.search(r"^[\(\)¥￥,\d\s\-]+$", t):
         return False
     if re.match(r"^\d+\s+", t):
         return False
-    if is_detail_like_line(t):
+    if is_subcategory_only(t):
         return False
     return True
 
@@ -191,9 +211,6 @@ def second_page_has_title_above_header(lines: List[str]) -> Tuple[bool, str]:
         return False, ""
 
     upper_lines = [clean_text(x) for x in lines[:header_idx] if clean_text(x)]
-    if not upper_lines:
-        return False, ""
-
     candidates = [x for x in upper_lines if is_page_title_candidate(x)]
     if not candidates:
         return False, ""
@@ -206,9 +223,20 @@ def should_skip_first_page(pdf) -> bool:
     if len(pdf.pages) < 2:
         return False
 
-    second_page_lines = extract_lines_from_page(pdf.pages[1])
-    has_title, _ = second_page_has_title_above_header(second_page_lines)
+    second_lines = extract_lines_from_page(pdf.pages[1])
+    has_title, _ = second_page_has_title_above_header(second_lines)
     return has_title
+
+
+def detect_major_category(lines: List[str]) -> str:
+    header_idx = find_header_index(lines)
+    if header_idx is not None:
+        upper_lines = [clean_text(x) for x in lines[:header_idx] if clean_text(x)]
+        candidates = [x for x in upper_lines if is_page_title_candidate(x)]
+        if candidates:
+            return normalize_major_category(candidates[-1])
+
+    return ""
 
 
 def extract_lines_from_page(page) -> List[str]:
@@ -223,16 +251,20 @@ def extract_lines_from_page(page) -> List[str]:
         page_text = page.extract_text() or ""
         return [clean_text(x) for x in page_text.splitlines() if clean_text(x)]
 
-    footer_cutoff = page.height - 28
+    footer_cutoff = page.height - 24
     usable_words = []
+
     for w in words:
         txt = clean_text(w.get("text", ""))
         if not txt:
             continue
+
         top = float(w["top"])
         bottom = float(w["bottom"])
+
         if top >= footer_cutoff or bottom >= footer_cutoff:
             continue
+
         usable_words.append(w)
 
     usable_words = sorted(usable_words, key=lambda w: (round(w["top"], 1), w["x0"]))
@@ -244,6 +276,7 @@ def extract_lines_from_page(page) -> List[str]:
 
     for w in usable_words:
         top = w["top"]
+
         if current_top is None:
             current = [w]
             current_top = top
@@ -270,27 +303,17 @@ def extract_lines_from_page(page) -> List[str]:
     return lines
 
 
-def detect_major_category(lines: List[str]) -> str:
-    header_idx = find_header_index(lines)
-    if header_idx is not None:
-        upper = [clean_text(x) for x in lines[:header_idx] if clean_text(x)]
-        candidates = [x for x in upper if is_page_title_candidate(x)]
-        if candidates:
-            return normalize_major_category(candidates[-1])
-
-    # ヘッダー上になければページ全体からの簡易救済
-    for line in lines[:8]:
-        t = clean_text(line)
-        if is_page_title_candidate(t):
-            return normalize_major_category(t)
-
-    return ""
-
-
-def is_detail_like_line(text: str) -> bool:
+def strip_inline_bracket_heading(text: str) -> str:
     t = clean_text(text)
-    parsed = parse_detail_line_core(t)
-    return parsed is not None
+    t = re.sub(r"^【[^】]+】\s*", "", t)
+    t = re.sub(r"^\[[^\]]+\]\s*", "", t)
+    return clean_text(t)
+
+
+def strip_leading_inner_no(text: str) -> str:
+    t = clean_text(text)
+    t = re.sub(r"^(?:\d+\s+)+", "", t)
+    return clean_text(t)
 
 
 def parse_detail_line_core(line: str) -> Optional[Dict]:
@@ -298,39 +321,42 @@ def parse_detail_line_core(line: str) -> Optional[Dict]:
     if not t:
         return None
 
-    # パターン1: no left qty unit unit_price amount
+    t = strip_inline_bracket_heading(t)
+
     m1 = re.match(
         r"^(?P<no>\d+)\s+(?P<left>.+?)\s+(?P<qty>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<unit>\S+)\s+(?P<unit_price>\(?¥?-?[\d,]+\)?)\s+(?P<amount>\(?¥?-?[\d,]+\)?)$",
+        r"(?P<unit>\S+)\s+(?P<unit_price>\(?[¥￥]?-?[\d,]+\)?)\s+"
+        r"(?P<amount>\(?[¥￥]?-?[\d,]+\)?)$",
         t
     )
     if m1:
+        left = strip_leading_inner_no(m1.group("left"))
         return {
             "no": clean_text(m1.group("no")),
-            "item_spec": clean_text(m1.group("left")),
+            "item_spec": clean_text(left),
             "quantity": clean_text(m1.group("qty")),
             "unit": clean_text(m1.group("unit")),
             "unit_price": normalize_money_token(m1.group("unit_price")),
             "amount": normalize_money_token(m1.group("amount")),
         }
 
-    # パターン2: no left unit qty unit_price amount
     m2 = re.match(
         r"^(?P<no>\d+)\s+(?P<left>.+?)\s+(?P<unit>\S+)\s+"
-        r"(?P<qty>-?\d+(?:\.\d+)?)\s+(?P<unit_price>\(?¥?-?[\d,]+\)?)\s+(?P<amount>\(?¥?-?[\d,]+\)?)$",
+        r"(?P<qty>-?\d+(?:\.\d+)?)\s+(?P<unit_price>\(?[¥￥]?-?[\d,]+\)?)\s+"
+        r"(?P<amount>\(?[¥￥]?-?[\d,]+\)?)$",
         t
     )
     if m2:
+        left = strip_leading_inner_no(m2.group("left"))
         return {
             "no": clean_text(m2.group("no")),
-            "item_spec": clean_text(m2.group("left")),
+            "item_spec": clean_text(left),
             "quantity": clean_text(m2.group("qty")),
             "unit": clean_text(m2.group("unit")),
             "unit_price": normalize_money_token(m2.group("unit_price")),
             "amount": normalize_money_token(m2.group("amount")),
         }
 
-    # パターン3: no left amount amount? broken no use
     return None
 
 
@@ -342,7 +368,7 @@ def parse_detail_line(line: str) -> Optional[Dict]:
     if is_header_line(t):
         return None
 
-    if any(x in t for x in ["御 見 積 書", "E S T I M A T E", "見積作成日", "振 込 先", "工 事 件 名", "工 事 場 所", "お支払い条件", "有効期限"]):
+    if looks_like_cover_noise(t):
         return None
 
     if "小計" in t or "小 計" in t:
@@ -433,6 +459,65 @@ def parse_detail_line(line: str) -> Optional[Dict]:
     }
 
 
+def line_starts_with_no(text: str) -> bool:
+    return LINE_START_NO_PATTERN.match(clean_text(text)) is not None
+
+
+def line_has_tail_values_only(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+
+    if line_starts_with_no(t):
+        return False
+
+    if re.search(
+        r"-?\d+(?:\.\d+)?\s+\S+\s+\(?[¥￥]?-?[\d,]+\)?\s+\(?[¥￥]?-?[\d,]+\)?$",
+        t
+    ):
+        return True
+
+    if re.search(
+        r"\S+\s+-?\d+(?:\.\d+)?\s+\(?[¥￥]?-?[\d,]+\)?\s+\(?[¥￥]?-?[\d,]+\)?$",
+        t
+    ):
+        return True
+
+    return False
+
+
+def should_merge_lines(current: str, nxt: str) -> bool:
+    current = clean_text(current)
+    nxt = clean_text(nxt)
+
+    if not current or not nxt:
+        return False
+
+    if parse_detail_line_core(current) is not None:
+        return False
+
+    if not line_starts_with_no(current):
+        return False
+
+    if line_starts_with_no(nxt):
+        return False
+
+    if is_subcategory_only(nxt):
+        return False
+
+    if is_header_line(nxt):
+        return False
+
+    if "小計" in nxt or "小 計" in nxt:
+        return False
+
+    if not line_has_tail_values_only(nxt):
+        return False
+
+    combined = clean_text(current + " " + nxt)
+    return parse_detail_line_core(combined) is not None
+
+
 def merge_multiline_details(lines: List[str]) -> List[str]:
     merged = []
     i = 0
@@ -443,32 +528,12 @@ def merge_multiline_details(lines: List[str]) -> List[str]:
             i += 1
             continue
 
-        # 先に通常パースできればそのまま
-        parsed = parse_detail_line_core(current)
-        if parsed is not None:
-            merged.append(current)
-            i += 1
-            continue
-
-        # 次行と結合してパースできるか試す
         if i + 1 < len(lines):
             nxt = clean_text(lines[i + 1])
-            combined = clean_text(current + " " + nxt)
-            parsed2 = parse_detail_line_core(combined)
-            if parsed2 is not None:
-                merged.append(combined)
+            if should_merge_lines(current, nxt):
+                merged.append(clean_text(current + " " + nxt))
                 i += 2
                 continue
-
-            # 先頭行が no + left だけ、次行に数量以降
-            m_left = re.match(r"^(?P<no>\d+)\s+(?P<left>.+)$", current)
-            if m_left:
-                combined2 = clean_text(current + " " + nxt)
-                parsed3 = parse_detail_line_core(combined2)
-                if parsed3 is not None:
-                    merged.append(combined2)
-                    i += 2
-                    continue
 
         merged.append(current)
         i += 1
@@ -532,6 +597,310 @@ def process_uploaded_file(uploaded_file) -> List[Dict]:
     return all_rows
 
 
+def list_pdf_names_in_uploaded_file(uploaded_file) -> List[str]:
+    """
+    アップロードされた1ファイルの中に含まれるPDF名一覧を返します。
+
+    想定:
+    - .pdf の場合は、そのファイル名だけ返す
+    - .zip の場合は、中に入っているPDF名一覧を返す
+    """
+    name = uploaded_file.name
+
+    if name.lower().endswith(".pdf"):
+        return [name]
+
+    if name.lower().endswith(".zip"):
+        zip_bytes = uploaded_file.getvalue()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            return sorted([n for n in z.namelist() if n.lower().endswith(".pdf")])
+
+    return []
+
+
+def get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name: str) -> bytes:
+    """
+    uploaded_file から、指定PDFの bytes を取り出します。
+
+    - uploaded_file 自体が PDF の場合は、そのまま返す
+    - uploaded_file が ZIP の場合は、中から pdf_name を読んで返す
+    """
+    name = uploaded_file.name
+
+    if name.lower().endswith(".pdf"):
+        if name != pdf_name:
+            raise ValueError(f"指定PDF名が一致しません: {pdf_name}")
+        return uploaded_file.getvalue()
+
+    if name.lower().endswith(".zip"):
+        zip_bytes = uploaded_file.getvalue()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            return z.read(pdf_name)
+
+    raise ValueError("PDFまたはZIPではないファイルです。")
+
+
+def extract_words_debug_from_page(page) -> List[Dict]:
+    """
+    1ページから word 情報を抽出します。
+    この関数は PoC 用で、通常抽出ではなく「座標確認」を目的としています。
+    """
+    words = page.extract_words(
+        keep_blank_chars=False,
+        use_text_flow=True,
+        x_tolerance=2,
+        y_tolerance=2,
+    )
+
+    footer_cutoff = page.height - 24
+    results = []
+
+    for w in words:
+        text = clean_text(w.get("text", ""))
+        if not text:
+            continue
+
+        top = float(w["top"])
+        bottom = float(w["bottom"])
+
+        if top >= footer_cutoff or bottom >= footer_cutoff:
+            continue
+
+        results.append({
+            "text": text,
+            "x0": float(w["x0"]),
+            "x1": float(w["x1"]),
+            "top": top,
+            "bottom": bottom,
+        })
+
+    return results
+
+
+def group_words_by_row(words: List[Dict], tolerance: float = 3.0) -> List[List[Dict]]:
+    """
+    word を top 座標ベースで行ごとにまとめます。
+    """
+    if not words:
+        return []
+
+    words_sorted = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+
+    rows = []
+    current = []
+    current_top = None
+
+    for w in words_sorted:
+        if current_top is None:
+            current = [w]
+            current_top = w["top"]
+            continue
+
+        if abs(w["top"] - current_top) <= tolerance:
+            current.append(w)
+        else:
+            rows.append(sorted(current, key=lambda x: x["x0"]))
+            current = [w]
+            current_top = w["top"]
+
+    if current:
+        rows.append(sorted(current, key=lambda x: x["x0"]))
+
+    return rows
+
+
+def row_words_to_text(row_words: List[Dict]) -> str:
+    """
+    1行分の words を左から結合して、見やすい1行テキストにします。
+    """
+    return " ".join(w["text"] for w in sorted(row_words, key=lambda x: x["x0"]))
+
+
+def find_header_row_words(rows: List[List[Dict]]) -> Optional[List[Dict]]:
+    """
+    ヘッダー行を探します。
+    """
+    header_keywords = ["NO.", "項目", "数量", "単位", "単価", "金額"]
+
+    for row in rows:
+        text = row_words_to_text(row)
+        score = sum(1 for k in header_keywords if k in text)
+        if score >= 5:
+            return row
+
+    return None
+
+
+def get_header_word_pos(header_row: List[Dict], keyword: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    ヘッダー行から、指定キーワードを含む word の x0 / x1 を返します。
+    """
+    for w in header_row:
+        if keyword in w["text"]:
+            return w["x0"], w["x1"]
+    return None, None
+
+
+def build_dynamic_column_boundaries(header_row: List[Dict]) -> Dict[str, Tuple[float, float]]:
+    """
+    ヘッダー語の位置から列境界を動的に作ります。
+    """
+    no_x0, no_x1 = get_header_word_pos(header_row, "NO.")
+    item_x0, item_x1 = get_header_word_pos(header_row, "項目")
+    qty_x0, qty_x1 = get_header_word_pos(header_row, "数量")
+    unit_x0, unit_x1 = get_header_word_pos(header_row, "単位")
+    unit_price_x0, unit_price_x1 = get_header_word_pos(header_row, "単価")
+    amount_x0, amount_x1 = get_header_word_pos(header_row, "金額")
+
+    required = [no_x0, no_x1, item_x0, item_x1, qty_x0, qty_x1, unit_x0, unit_x1, unit_price_x0, unit_price_x1, amount_x0, amount_x1]
+    if any(v is None for v in required):
+        raise ValueError("ヘッダー語の位置取得に失敗しました。")
+
+    margin = 6
+
+    boundaries = {
+        "no": (
+            max(0, no_x0 - margin),
+            (item_x0 + no_x1) / 2
+        ),
+        "item_spec": (
+            max(0, item_x0 - margin),
+            (qty_x0 + item_x1) / 2
+        ),
+        "quantity": (
+            max(0, qty_x0 - margin),
+            (unit_x0 + qty_x1) / 2
+        ),
+        "unit": (
+            max(0, unit_x0 - margin),
+            (unit_price_x0 + unit_x1) / 2
+        ),
+        "unit_price": (
+            max(0, unit_price_x0 - margin),
+            (amount_x0 + unit_price_x1) / 2
+        ),
+        "amount": (
+            max(0, amount_x0 - margin),
+            9999.0
+        ),
+    }
+
+    return boundaries
+
+
+def assign_word_to_dynamic_column(word: Dict, boundaries: Dict[str, Tuple[float, float]]) -> Optional[str]:
+    """
+    1つの word を、列境界に基づいてどの列に属するか判定します。
+    """
+    center_x = (word["x0"] + word["x1"]) / 2
+
+    for col_name, (x_min, x_max) in boundaries.items():
+        if x_min <= center_x < x_max:
+            return col_name
+
+    return None
+
+
+def row_words_to_dynamic_record(row_words: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> Dict:
+    """
+    1行分の words を動的列境界で6列に振り分けます。
+    """
+    buckets = {
+        "no": [],
+        "item_spec": [],
+        "quantity": [],
+        "unit": [],
+        "unit_price": [],
+        "amount": [],
+    }
+
+    for w in row_words:
+        col = assign_word_to_dynamic_column(w, boundaries)
+        if col is not None:
+            buckets[col].append(w["text"])
+
+    return {
+        "no": " ".join(buckets["no"]).strip(),
+        "item_spec": " ".join(buckets["item_spec"]).strip(),
+        "quantity": " ".join(buckets["quantity"]).strip(),
+        "unit": " ".join(buckets["unit"]).strip(),
+        "unit_price": " ".join(buckets["unit_price"]).strip(),
+        "amount": " ".join(buckets["amount"]).strip(),
+        "raw_row": row_words_to_text(row_words),
+    }
+
+
+def is_poc_detail_record(record: Dict) -> bool:
+    """
+    PoC用のゆるい明細判定。
+    """
+    no_text = clean_text(record.get("no", ""))
+    amount_text = clean_text(record.get("amount", ""))
+
+    if not no_text:
+        return False
+
+    if not re.match(r"^\d+", no_text):
+        return False
+
+    if not amount_text:
+        return False
+
+    return True
+
+
+def run_single_page_poc(uploaded_file, pdf_name: str, page_num: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Tuple[float, float]], str]:
+    """
+    1ページ限定の PoC を実行します。
+
+    返すもの:
+    - 抽出word一覧DataFrame
+    - 仮明細抽出DataFrame
+    - 列境界dict
+    - 検出ヘッダー文字列
+    """
+    pdf_bytes = get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name)
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if page_num < 1 or page_num > len(pdf.pages):
+            raise ValueError(f"ページ番号が不正です。指定: {page_num}, 総ページ数: {len(pdf.pages)}")
+
+        page = pdf.pages[page_num - 1]
+
+        words = extract_words_debug_from_page(page)
+        rows = group_words_by_row(words)
+        header_row = find_header_row_words(rows)
+
+        if header_row is None:
+            raise ValueError("ヘッダー行が見つかりませんでした。")
+
+        boundaries = build_dynamic_column_boundaries(header_row)
+        header_text = row_words_to_text(header_row)
+
+        words_df = pd.DataFrame(words, columns=["text", "x0", "x1", "top", "bottom"])
+
+        header_top = min(w["top"] for w in header_row)
+
+        records = []
+        for row in rows:
+            row_top = min(w["top"] for w in row)
+            if row_top <= header_top:
+                continue
+
+            rec = row_words_to_dynamic_record(row, boundaries)
+            rec["row_top"] = row_top
+            rec["is_detail_like"] = 1 if is_poc_detail_record(rec) else 0
+            records.append(rec)
+
+        record_df = pd.DataFrame(records)
+
+        detail_df = record_df[record_df["is_detail_like"] == 1].copy() if not record_df.empty else pd.DataFrame(
+            columns=["no", "item_spec", "quantity", "unit", "unit_price", "amount", "raw_row", "row_top", "is_detail_like"]
+        )
+
+        return words_df, detail_df, boundaries, header_text
+
+
 def is_noise_row(row: pd.Series) -> bool:
     raw = clean_text(row.get("raw_row", ""))
     major = clean_text(row.get("major_category", ""))
@@ -564,7 +933,7 @@ def is_noise_row(row: pd.Series) -> bool:
     if ONLY_NUMBER_PATTERN.match(raw):
         return True
 
-    if raw in {"御 見 積 書", "E S T I M A T E"}:
+    if looks_like_cover_noise(raw):
         return True
 
     if needs_review == 1 and not any([qty, unit, unit_price, amount]):
@@ -647,7 +1016,72 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+st.divider()
+st.subheader("1ページ検証モード（PoC）")
+st.write("通常抽出とは別に、1ページだけを対象に座標ベースの列抽出を検証します。")
+enable_poc_mode = st.checkbox("1ページ検証モードを使う", value=False)
+
 if uploaded_files:
+    if enable_poc_mode:
+        st.info("検証モードでは、アップロードしたファイルのうち1つを選び、1ページだけ座標ベースで解析します。")
+
+        uploaded_name_map = {f.name: f for f in uploaded_files}
+        selected_uploaded_name = st.selectbox(
+            "検証対象ファイル",
+            options=list(uploaded_name_map.keys()),
+            index=0
+        )
+        selected_uploaded_file = uploaded_name_map[selected_uploaded_name]
+
+        pdf_names = list_pdf_names_in_uploaded_file(selected_uploaded_file)
+
+        if pdf_names:
+            selected_pdf_name = st.selectbox(
+                "ZIP内PDF名（PDF単体アップロード時はそのファイル名）",
+                options=pdf_names,
+                index=0
+            )
+
+            selected_page_num = st.number_input(
+                "検証ページ番号",
+                min_value=1,
+                value=2,
+                step=1
+            )
+
+            if st.button("このページを検証する"):
+                try:
+                    words_df, detail_df, boundaries, header_text = run_single_page_poc(
+                        selected_uploaded_file,
+                        selected_pdf_name,
+                        int(selected_page_num)
+                    )
+
+                    st.success("1ページ検証が完了しました。")
+
+                    st.write("検出ヘッダー")
+                    st.code(header_text)
+
+                    st.write("列境界")
+                    boundary_df = pd.DataFrame(
+                        [
+                            {"column": k, "x_min": v[0], "x_max": v[1]}
+                            for k, v in boundaries.items()
+                        ]
+                    )
+                    st.dataframe(boundary_df, use_container_width=True, height=250)
+
+                    st.write("word座標一覧")
+                    st.dataframe(words_df, use_container_width=True, height=300)
+
+                    st.write("仮抽出結果（座標ベース）")
+                    st.dataframe(detail_df, use_container_width=True, height=350)
+
+                except Exception as e:
+                    st.error(f"検証モードでエラーが発生しました: {e}")
+        else:
+            st.warning("このファイルからPDFが見つかりませんでした。")
+
     rows = []
     for uploaded_file in uploaded_files:
         rows.extend(process_uploaded_file(uploaded_file))
