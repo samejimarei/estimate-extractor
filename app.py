@@ -45,7 +45,8 @@ PASTE_COLUMNS = [
 UNIT_CANDIDATES = {
     "式", "台", "枚", "本", "箇所", "箇", "ｍ", "m", "m2", "㎡", "㎥",
     "日", "セット", "ｾｯﾄ", "人工", "個", "ヶ所", "箱", "巻", "丁", "脚", "面",
-    "缶", "脚", "帖", "箇", "室", "ヶ", "双", "組", "箇口",
+    "缶", "帖", "室", "ヶ", "双", "組", "箇口", "A工", "B工", "C工", "L", "kg",
+    "回", "樽", "人", "時間", "工", "箇", "坪", "帖", "畳", "m3", "㎏", "箇所分"
 }
 
 DATE_PATTERNS = [
@@ -597,13 +598,13 @@ def process_uploaded_file(uploaded_file) -> List[Dict]:
     return all_rows
 
 
+# ============================================================
+# PoC 検証モード用関数群
+# ============================================================
+
 def list_pdf_names_in_uploaded_file(uploaded_file) -> List[str]:
     """
     アップロードされた1ファイルの中に含まれるPDF名一覧を返します。
-
-    想定:
-    - .pdf の場合は、そのファイル名だけ返す
-    - .zip の場合は、中に入っているPDF名一覧を返す
     """
     name = uploaded_file.name
 
@@ -621,9 +622,6 @@ def list_pdf_names_in_uploaded_file(uploaded_file) -> List[str]:
 def get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name: str) -> bytes:
     """
     uploaded_file から、指定PDFの bytes を取り出します。
-
-    - uploaded_file 自体が PDF の場合は、そのまま返す
-    - uploaded_file が ZIP の場合は、中から pdf_name を読んで返す
     """
     name = uploaded_file.name
 
@@ -643,7 +641,6 @@ def get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name: str) -> bytes:
 def extract_words_debug_from_page(page) -> List[Dict]:
     """
     1ページから word 情報を抽出します。
-    この関数は PoC 用で、通常抽出ではなく「座標確認」を目的としています。
     """
     words = page.extract_words(
         keep_blank_chars=False,
@@ -710,9 +707,6 @@ def group_words_by_row(words: List[Dict], tolerance: float = 3.0) -> List[List[D
 
 
 def row_words_to_text(row_words: List[Dict]) -> str:
-    """
-    1行分の words を左から結合して、見やすい1行テキストにします。
-    """
     return " ".join(w["text"] for w in sorted(row_words, key=lambda x: x["x0"]))
 
 
@@ -732,9 +726,6 @@ def find_header_row_words(rows: List[List[Dict]]) -> Optional[List[Dict]]:
 
 
 def get_header_word_pos(header_row: List[Dict], keyword: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    ヘッダー行から、指定キーワードを含む word の x0 / x1 を返します。
-    """
     for w in header_row:
         if keyword in w["text"]:
             return w["x0"], w["x1"]
@@ -789,9 +780,6 @@ def build_dynamic_column_boundaries(header_row: List[Dict]) -> Dict[str, Tuple[f
 
 
 def assign_word_to_dynamic_column(word: Dict, boundaries: Dict[str, Tuple[float, float]]) -> Optional[str]:
-    """
-    1つの word を、列境界に基づいてどの列に属するか判定します。
-    """
     center_x = (word["x0"] + word["x1"]) / 2
 
     for col_name, (x_min, x_max) in boundaries.items():
@@ -830,23 +818,261 @@ def row_words_to_dynamic_record(row_words: List[Dict], boundaries: Dict[str, Tup
     }
 
 
+def is_date_fragment_text(text: str) -> bool:
+    """
+    日付断片・ページ断片のようなノイズを判定します。
+    例:
+    2 5
+    / 1
+    3 1
+    2025
+    /1
+    """
+    t = clean_text(text)
+    if not t:
+        return True
+
+    if re.fullmatch(r"\d{1,2}\s+\d{1,2}", t):
+        return True
+
+    if re.fullmatch(r"/\s*\d{1,2}", t):
+        return True
+
+    if re.fullmatch(r"\d{1,2}\s*/", t):
+        return True
+
+    if re.fullmatch(r"\d{4}", t):
+        return True
+
+    if re.fullmatch(r"\d{1,2}", t):
+        return True
+
+    if re.fullmatch(r"/", t):
+        return True
+
+    if len(t) <= 4 and re.fullmatch(r"[\d/\-]+", t):
+        return True
+
+    return False
+
+
+def row_has_money_like_text(record: Dict) -> bool:
+    unit_price = clean_text(record.get("unit_price", ""))
+    amount = clean_text(record.get("amount", ""))
+    raw_row = clean_text(record.get("raw_row", ""))
+
+    if is_money_token(unit_price) or is_money_token(amount):
+        return True
+
+    money_hits = re.findall(r"[¥￥]?[\d,]{3,}", raw_row)
+    return len(money_hits) >= 2
+
+
+def row_has_tail_value_pattern(record: Dict) -> bool:
+    """
+    continuation 行らしさを見る。
+    quantity / unit / unit_price / amount の右側列がそれっぽく埋まっているか。
+    """
+    qty = clean_text(record.get("quantity", ""))
+    unit = clean_text(record.get("unit", ""))
+    unit_price = clean_text(record.get("unit_price", ""))
+    amount = clean_text(record.get("amount", ""))
+
+    score = 0
+    if qty and (is_quantity_token(qty) or re.search(r"\d", qty)):
+        score += 1
+    if unit:
+        score += 1
+    if unit_price and is_money_token(unit_price):
+        score += 1
+    if amount and is_money_token(amount):
+        score += 1
+
+    return score >= 3
+
+
+def is_poc_noise_row(row_words: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> bool:
+    """
+    PoC用のノイズ行判定。
+    日付断片や短すぎる数字断片行を落とします。
+    """
+    text = row_words_to_text(row_words)
+    record = row_words_to_dynamic_record(row_words, boundaries)
+
+    if is_date_fragment_text(text):
+        return True
+
+    if is_header_line(text):
+        return True
+
+    if "小計" in text or "小 計" in text:
+        return True
+
+    if looks_like_cover_noise(text):
+        return True
+
+    no_text = clean_text(record.get("no", ""))
+    item_text = clean_text(record.get("item_spec", ""))
+    qty = clean_text(record.get("quantity", ""))
+    unit = clean_text(record.get("unit", ""))
+    unit_price = clean_text(record.get("unit_price", ""))
+    amount = clean_text(record.get("amount", ""))
+
+    # ほぼ何も持たない短行はノイズ
+    non_empty = [x for x in [no_text, item_text, qty, unit, unit_price, amount] if x]
+    if len(non_empty) == 0:
+        return True
+
+    if len(non_empty) == 1 and len(text) <= 4:
+        return True
+
+    return False
+
+
+def merge_row_words(left: List[Dict], right: List[Dict]) -> List[Dict]:
+    """
+    2行分の words を結合し、x順に整えた1行として返します。
+    """
+    merged = left + right
+    return sorted(merged, key=lambda x: x["x0"])
+
+
+def should_merge_poc_rows(current_row: List[Dict], next_row: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> bool:
+    """
+    PoC用の分断明細再結合判定。
+
+    想定している分断:
+    前行: 3 現場管理費
+    次行: 45 日 ¥15,000 ¥675,000
+
+    または
+    前行: 3 トイレ手洗いカウンター 加工取付費
+    次行: 1 枚 ¥xx,xxx ¥xx,xxx
+    """
+    cur = row_words_to_dynamic_record(current_row, boundaries)
+    nxt = row_words_to_dynamic_record(next_row, boundaries)
+
+    cur_no = clean_text(cur["no"])
+    nxt_no = clean_text(nxt["no"])
+
+    cur_item = clean_text(cur["item_spec"])
+    cur_amount = clean_text(cur["amount"])
+    cur_unit_price = clean_text(cur["unit_price"])
+
+    nxt_amount = clean_text(nxt["amount"])
+    nxt_unit_price = clean_text(nxt["unit_price"])
+    nxt_qty = clean_text(nxt["quantity"])
+    nxt_unit = clean_text(nxt["unit"])
+
+    # 次行が明らかな日付断片なら結合しない
+    if is_date_fragment_text(nxt["raw_row"]):
+        return False
+
+    # 現行が no を持ち、まだ右側列が不完全
+    current_is_stub = bool(re.match(r"^\d+$", cur_no)) and (
+        not cur_amount or not cur_unit_price or len(cur_item) <= 20
+    )
+
+    # 次行が continuation っぽい
+    next_is_cont = (
+        not nxt_no and
+        (
+            (nxt_amount and is_money_token(nxt_amount)) or
+            (nxt_unit_price and is_money_token(nxt_unit_price))
+        ) and
+        (nxt_qty or nxt_unit or nxt_unit_price or nxt_amount)
+    )
+
+    if current_is_stub and next_is_cont:
+        return True
+
+    # 前行 no あり、次行も no は無いが右側3列以上埋まる
+    if bool(cur_no) and not nxt_no and row_has_tail_value_pattern(nxt):
+        return True
+
+    return False
+
+
+def merge_split_rows_for_poc(rows: List[List[Dict]], boundaries: Dict[str, Tuple[float, float]]) -> List[List[Dict]]:
+    """
+    ノイズ除去後の rows に対して、分断明細の再結合を行います。
+    """
+    if not rows:
+        return []
+
+    merged_rows = []
+    i = 0
+
+    while i < len(rows):
+        current = rows[i]
+
+        if i + 1 < len(rows):
+            nxt = rows[i + 1]
+            if should_merge_poc_rows(current, nxt, boundaries):
+                merged_rows.append(merge_row_words(current, nxt))
+                i += 2
+                continue
+
+        merged_rows.append(current)
+        i += 1
+
+    return merged_rows
+
+
+def detail_score(record: Dict) -> int:
+    """
+    PoC用の明細スコア。
+    right-side列の充足度を重視します。
+    """
+    score = 0
+
+    no_text = clean_text(record.get("no", ""))
+    item_text = clean_text(record.get("item_spec", ""))
+    qty = clean_text(record.get("quantity", ""))
+    unit = clean_text(record.get("unit", ""))
+    unit_price = clean_text(record.get("unit_price", ""))
+    amount = clean_text(record.get("amount", ""))
+
+    if no_text and re.match(r"^\d+", no_text):
+        score += 2
+
+    if item_text:
+        score += 1
+
+    if qty and (is_quantity_token(qty) or re.search(r"\d", qty)):
+        score += 2
+
+    if unit:
+        score += 1
+
+    if unit_price and is_money_token(unit_price):
+        score += 2
+
+    if amount and is_money_token(amount):
+        score += 3
+
+    return score
+
+
 def is_poc_detail_record(record: Dict) -> bool:
     """
-    PoC用のゆるい明細判定。
+    PoC用の明細判定。
+    以前の「no + amount」より少し賢くします。
     """
-    no_text = clean_text(record.get("no", ""))
-    amount_text = clean_text(record.get("amount", ""))
+    text = clean_text(record.get("raw_row", ""))
+    score = detail_score(record)
 
-    if not no_text:
+    if is_date_fragment_text(text):
         return False
 
-    if not re.match(r"^\d+", no_text):
+    if "小計" in text or "小 計" in text:
         return False
 
-    if not amount_text:
-        return False
+    # amount がある行はかなり優先
+    if clean_text(record.get("amount", "")) and is_money_token(record.get("amount", "")):
+        return score >= 6
 
-    return True
+    return score >= 7
 
 
 def run_single_page_poc(uploaded_file, pdf_name: str, page_num: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Tuple[float, float]], str]:
@@ -881,21 +1107,32 @@ def run_single_page_poc(uploaded_file, pdf_name: str, page_num: int) -> Tuple[pd
 
         header_top = min(w["top"] for w in header_row)
 
-        records = []
+        body_rows = []
         for row in rows:
             row_top = min(w["top"] for w in row)
             if row_top <= header_top:
                 continue
+            body_rows.append(row)
 
+        # まずノイズ行を落とす
+        filtered_rows = [row for row in body_rows if not is_poc_noise_row(row, boundaries)]
+
+        # 次に分断行を再結合
+        merged_rows = merge_split_rows_for_poc(filtered_rows, boundaries)
+
+        records = []
+        for row in merged_rows:
+            row_top = min(w["top"] for w in row)
             rec = row_words_to_dynamic_record(row, boundaries)
             rec["row_top"] = row_top
+            rec["detail_score"] = detail_score(rec)
             rec["is_detail_like"] = 1 if is_poc_detail_record(rec) else 0
             records.append(rec)
 
         record_df = pd.DataFrame(records)
 
         detail_df = record_df[record_df["is_detail_like"] == 1].copy() if not record_df.empty else pd.DataFrame(
-            columns=["no", "item_spec", "quantity", "unit", "unit_price", "amount", "raw_row", "row_top", "is_detail_like"]
+            columns=["no", "item_spec", "quantity", "unit", "unit_price", "amount", "raw_row", "row_top", "detail_score", "is_detail_like"]
         )
 
         return words_df, detail_df, boundaries, header_text
