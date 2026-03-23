@@ -46,7 +46,7 @@ UNIT_CANDIDATES = {
     "式", "台", "枚", "本", "箇所", "箇", "ｍ", "m", "m2", "㎡", "㎥",
     "日", "セット", "ｾｯﾄ", "人工", "個", "ヶ所", "箱", "巻", "丁", "脚", "面",
     "缶", "帖", "室", "ヶ", "双", "組", "箇口", "A工", "B工", "C工", "L", "kg",
-    "回", "樽", "人", "時間", "工", "箇", "坪", "帖", "畳", "m3", "㎏", "箇所分"
+    "回", "樽", "人", "時間", "工", "坪", "畳", "m3", "㎏", "箇所分"
 }
 
 DATE_PATTERNS = [
@@ -542,106 +542,11 @@ def merge_multiline_details(lines: List[str]) -> List[str]:
     return merged
 
 
-def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
-    rows = []
-
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        estimate_date = extract_estimate_date(pdf)
-        skip_first_page = should_skip_first_page(pdf)
-
-        for page_num, page in enumerate(pdf.pages, start=1):
-            if page_num == 1 and skip_first_page:
-                continue
-
-            lines = extract_lines_from_page(page)
-            lines = merge_multiline_details(lines)
-            major_category = detect_major_category(lines)
-
-            for line in lines:
-                parsed = parse_detail_line(line)
-                if not parsed:
-                    continue
-
-                rows.append({
-                    "file_name": file_name,
-                    "estimate_date": estimate_date,
-                    "page": page_num,
-                    "major_category": major_category,
-                    "no": parsed["no"],
-                    "item_spec": parsed["item_spec"],
-                    "quantity": parsed["quantity"],
-                    "unit": parsed["unit"],
-                    "unit_price": parsed["unit_price"],
-                    "amount": parsed["amount"],
-                    "raw_row": parsed["raw_row"],
-                    "needs_review": parsed["needs_review"],
-                })
-
-    return rows
-
-
-def process_uploaded_file(uploaded_file) -> List[Dict]:
-    all_rows = []
-
-    if uploaded_file.name.lower().endswith(".pdf"):
-        file_bytes = uploaded_file.read()
-        all_rows.extend(process_pdf(uploaded_file.name, file_bytes))
-
-    elif uploaded_file.name.lower().endswith(".zip"):
-        zip_bytes = uploaded_file.read()
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-            for name in z.namelist():
-                if name.lower().endswith(".pdf"):
-                    file_bytes = z.read(name)
-                    all_rows.extend(process_pdf(name, file_bytes))
-
-    return all_rows
-
-
 # ============================================================
-# PoC 検証モード用関数群
+# 座標ベース本番抽出用関数群
 # ============================================================
-
-def list_pdf_names_in_uploaded_file(uploaded_file) -> List[str]:
-    """
-    アップロードされた1ファイルの中に含まれるPDF名一覧を返します。
-    """
-    name = uploaded_file.name
-
-    if name.lower().endswith(".pdf"):
-        return [name]
-
-    if name.lower().endswith(".zip"):
-        zip_bytes = uploaded_file.getvalue()
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-            return sorted([n for n in z.namelist() if n.lower().endswith(".pdf")])
-
-    return []
-
-
-def get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name: str) -> bytes:
-    """
-    uploaded_file から、指定PDFの bytes を取り出します。
-    """
-    name = uploaded_file.name
-
-    if name.lower().endswith(".pdf"):
-        if name != pdf_name:
-            raise ValueError(f"指定PDF名が一致しません: {pdf_name}")
-        return uploaded_file.getvalue()
-
-    if name.lower().endswith(".zip"):
-        zip_bytes = uploaded_file.getvalue()
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-            return z.read(pdf_name)
-
-    raise ValueError("PDFまたはZIPではないファイルです。")
-
 
 def extract_words_debug_from_page(page) -> List[Dict]:
-    """
-    1ページから word 情報を抽出します。
-    """
     words = page.extract_words(
         keep_blank_chars=False,
         use_text_flow=True,
@@ -675,9 +580,6 @@ def extract_words_debug_from_page(page) -> List[Dict]:
 
 
 def group_words_by_row(words: List[Dict], tolerance: float = 3.0) -> List[List[Dict]]:
-    """
-    word を top 座標ベースで行ごとにまとめます。
-    """
     if not words:
         return []
 
@@ -711,9 +613,6 @@ def row_words_to_text(row_words: List[Dict]) -> str:
 
 
 def find_header_row_words(rows: List[List[Dict]]) -> Optional[List[Dict]]:
-    """
-    ヘッダー行を探します。
-    """
     header_keywords = ["NO.", "項目", "数量", "単位", "単価", "金額"]
 
     for row in rows:
@@ -733,9 +632,6 @@ def get_header_word_pos(header_row: List[Dict], keyword: str) -> Tuple[Optional[
 
 
 def build_dynamic_column_boundaries(header_row: List[Dict]) -> Dict[str, Tuple[float, float]]:
-    """
-    ヘッダー語の位置から列境界を動的に作ります。
-    """
     no_x0, no_x1 = get_header_word_pos(header_row, "NO.")
     item_x0, item_x1 = get_header_word_pos(header_row, "項目")
     qty_x0, qty_x1 = get_header_word_pos(header_row, "数量")
@@ -743,7 +639,10 @@ def build_dynamic_column_boundaries(header_row: List[Dict]) -> Dict[str, Tuple[f
     unit_price_x0, unit_price_x1 = get_header_word_pos(header_row, "単価")
     amount_x0, amount_x1 = get_header_word_pos(header_row, "金額")
 
-    required = [no_x0, no_x1, item_x0, item_x1, qty_x0, qty_x1, unit_x0, unit_x1, unit_price_x0, unit_price_x1, amount_x0, amount_x1]
+    required = [
+        no_x0, no_x1, item_x0, item_x1, qty_x0, qty_x1,
+        unit_x0, unit_x1, unit_price_x0, unit_price_x1, amount_x0, amount_x1
+    ]
     if any(v is None for v in required):
         raise ValueError("ヘッダー語の位置取得に失敗しました。")
 
@@ -790,9 +689,6 @@ def assign_word_to_dynamic_column(word: Dict, boundaries: Dict[str, Tuple[float,
 
 
 def row_words_to_dynamic_record(row_words: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> Dict:
-    """
-    1行分の words を動的列境界で6列に振り分けます。
-    """
     buckets = {
         "no": [],
         "item_spec": [],
@@ -808,26 +704,17 @@ def row_words_to_dynamic_record(row_words: List[Dict], boundaries: Dict[str, Tup
             buckets[col].append(w["text"])
 
     return {
-        "no": " ".join(buckets["no"]).strip(),
-        "item_spec": " ".join(buckets["item_spec"]).strip(),
-        "quantity": " ".join(buckets["quantity"]).strip(),
-        "unit": " ".join(buckets["unit"]).strip(),
-        "unit_price": " ".join(buckets["unit_price"]).strip(),
-        "amount": " ".join(buckets["amount"]).strip(),
-        "raw_row": row_words_to_text(row_words),
+        "no": clean_text(" ".join(buckets["no"])),
+        "item_spec": clean_text(" ".join(buckets["item_spec"])),
+        "quantity": clean_text(" ".join(buckets["quantity"])),
+        "unit": clean_text(" ".join(buckets["unit"])),
+        "unit_price": clean_text(" ".join(buckets["unit_price"])),
+        "amount": clean_text(" ".join(buckets["amount"])),
+        "raw_row": clean_text(row_words_to_text(row_words)),
     }
 
 
 def is_date_fragment_text(text: str) -> bool:
-    """
-    日付断片・ページ断片のようなノイズを判定します。
-    例:
-    2 5
-    / 1
-    3 1
-    2025
-    /1
-    """
     t = clean_text(text)
     if not t:
         return True
@@ -856,23 +743,7 @@ def is_date_fragment_text(text: str) -> bool:
     return False
 
 
-def row_has_money_like_text(record: Dict) -> bool:
-    unit_price = clean_text(record.get("unit_price", ""))
-    amount = clean_text(record.get("amount", ""))
-    raw_row = clean_text(record.get("raw_row", ""))
-
-    if is_money_token(unit_price) or is_money_token(amount):
-        return True
-
-    money_hits = re.findall(r"[¥￥]?[\d,]{3,}", raw_row)
-    return len(money_hits) >= 2
-
-
 def row_has_tail_value_pattern(record: Dict) -> bool:
-    """
-    continuation 行らしさを見る。
-    quantity / unit / unit_price / amount の右側列がそれっぽく埋まっているか。
-    """
     qty = clean_text(record.get("quantity", ""))
     unit = clean_text(record.get("unit", ""))
     unit_price = clean_text(record.get("unit_price", ""))
@@ -892,10 +763,6 @@ def row_has_tail_value_pattern(record: Dict) -> bool:
 
 
 def is_poc_noise_row(row_words: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> bool:
-    """
-    PoC用のノイズ行判定。
-    日付断片や短すぎる数字断片行を落とします。
-    """
     text = row_words_to_text(row_words)
     record = row_words_to_dynamic_record(row_words, boundaries)
 
@@ -918,7 +785,6 @@ def is_poc_noise_row(row_words: List[Dict], boundaries: Dict[str, Tuple[float, f
     unit_price = clean_text(record.get("unit_price", ""))
     amount = clean_text(record.get("amount", ""))
 
-    # ほぼ何も持たない短行はノイズ
     non_empty = [x for x in [no_text, item_text, qty, unit, unit_price, amount] if x]
     if len(non_empty) == 0:
         return True
@@ -930,25 +796,11 @@ def is_poc_noise_row(row_words: List[Dict], boundaries: Dict[str, Tuple[float, f
 
 
 def merge_row_words(left: List[Dict], right: List[Dict]) -> List[Dict]:
-    """
-    2行分の words を結合し、x順に整えた1行として返します。
-    """
     merged = left + right
     return sorted(merged, key=lambda x: x["x0"])
 
 
 def should_merge_poc_rows(current_row: List[Dict], next_row: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> bool:
-    """
-    PoC用の分断明細再結合判定。
-
-    想定している分断:
-    前行: 3 現場管理費
-    次行: 45 日 ¥15,000 ¥675,000
-
-    または
-    前行: 3 トイレ手洗いカウンター 加工取付費
-    次行: 1 枚 ¥xx,xxx ¥xx,xxx
-    """
     cur = row_words_to_dynamic_record(current_row, boundaries)
     nxt = row_words_to_dynamic_record(next_row, boundaries)
 
@@ -964,16 +816,19 @@ def should_merge_poc_rows(current_row: List[Dict], next_row: List[Dict], boundar
     nxt_qty = clean_text(nxt["quantity"])
     nxt_unit = clean_text(nxt["unit"])
 
-    # 次行が明らかな日付断片なら結合しない
     if is_date_fragment_text(nxt["raw_row"]):
         return False
 
-    # 現行が no を持ち、まだ右側列が不完全
+    if is_header_line(nxt["raw_row"]):
+        return False
+
+    if "小計" in nxt["raw_row"] or "小 計" in nxt["raw_row"]:
+        return False
+
     current_is_stub = bool(re.match(r"^\d+$", cur_no)) and (
-        not cur_amount or not cur_unit_price or len(cur_item) <= 20
+        not cur_amount or not cur_unit_price or len(cur_item) <= 30
     )
 
-    # 次行が continuation っぽい
     next_is_cont = (
         not nxt_no and
         (
@@ -986,7 +841,6 @@ def should_merge_poc_rows(current_row: List[Dict], next_row: List[Dict], boundar
     if current_is_stub and next_is_cont:
         return True
 
-    # 前行 no あり、次行も no は無いが右側3列以上埋まる
     if bool(cur_no) and not nxt_no and row_has_tail_value_pattern(nxt):
         return True
 
@@ -994,9 +848,6 @@ def should_merge_poc_rows(current_row: List[Dict], next_row: List[Dict], boundar
 
 
 def merge_split_rows_for_poc(rows: List[List[Dict]], boundaries: Dict[str, Tuple[float, float]]) -> List[List[Dict]]:
-    """
-    ノイズ除去後の rows に対して、分断明細の再結合を行います。
-    """
     if not rows:
         return []
 
@@ -1020,10 +871,6 @@ def merge_split_rows_for_poc(rows: List[List[Dict]], boundaries: Dict[str, Tuple
 
 
 def detail_score(record: Dict) -> int:
-    """
-    PoC用の明細スコア。
-    right-side列の充足度を重視します。
-    """
     score = 0
 
     no_text = clean_text(record.get("no", ""))
@@ -1055,10 +902,6 @@ def detail_score(record: Dict) -> int:
 
 
 def is_poc_detail_record(record: Dict) -> bool:
-    """
-    PoC用の明細判定。
-    以前の「no + amount」より少し賢くします。
-    """
     text = clean_text(record.get("raw_row", ""))
     score = detail_score(record)
 
@@ -1068,23 +911,238 @@ def is_poc_detail_record(record: Dict) -> bool:
     if "小計" in text or "小 計" in text:
         return False
 
-    # amount がある行はかなり優先
     if clean_text(record.get("amount", "")) and is_money_token(record.get("amount", "")):
         return score >= 6
 
     return score >= 7
 
 
-def run_single_page_poc(uploaded_file, pdf_name: str, page_num: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Tuple[float, float]], str]:
-    """
-    1ページ限定の PoC を実行します。
+def classify_record_status(record: Dict) -> str:
+    score = detail_score(record)
+    amount = clean_text(record.get("amount", ""))
+    unit_price = clean_text(record.get("unit_price", ""))
+    qty = clean_text(record.get("quantity", ""))
+    unit = clean_text(record.get("unit", ""))
+    no = clean_text(record.get("no", ""))
+    item_spec = clean_text(record.get("item_spec", ""))
 
-    返すもの:
-    - 抽出word一覧DataFrame
-    - 仮明細抽出DataFrame
-    - 列境界dict
-    - 検出ヘッダー文字列
-    """
+    full_ok = (
+        no and item_spec and qty and unit and unit_price and amount and
+        is_money_token(unit_price) and is_money_token(amount)
+    )
+    if full_ok:
+        return "complete"
+
+    rescued_ok = (
+        item_spec and
+        qty and unit and unit_price and amount and
+        is_money_token(unit_price) and is_money_token(amount) and
+        score >= 6
+    )
+    if rescued_ok:
+        return "rescued"
+
+    return "review"
+
+
+def extract_page_rows_with_boundaries(page) -> Tuple[List[List[Dict]], Dict[str, Tuple[float, float]], str]:
+    words = extract_words_debug_from_page(page)
+    rows = group_words_by_row(words)
+
+    if not rows:
+        raise ValueError("ページ内にwordが見つかりませんでした。")
+
+    header_row = find_header_row_words(rows)
+    if header_row is None:
+        raise ValueError("ヘッダー行が見つかりませんでした。")
+
+    boundaries = build_dynamic_column_boundaries(header_row)
+    header_text = row_words_to_text(header_row)
+    header_top = min(w["top"] for w in header_row)
+
+    body_rows = []
+    for row in rows:
+        row_top = min(w["top"] for w in row)
+        if row_top <= header_top:
+            continue
+        body_rows.append(row)
+
+    return body_rows, boundaries, header_text
+
+
+def detect_major_category_from_page_rows(page_rows: List[List[Dict]], header_text: str = "") -> str:
+    lines = []
+    if header_text:
+        lines.append(header_text)
+
+    # 実際には body_rows には header より上が無いので、ここは fallback 用
+    for row in page_rows[:5]:
+        lines.append(row_words_to_text(row))
+
+    # 既存ロジックに寄せた fallback
+    return detect_major_category(lines)
+
+
+def parse_record_to_output_row(record: Dict, file_name: str, estimate_date: str, page_num: int, major_category: str) -> Dict:
+    status = classify_record_status(record)
+    needs_review = 0 if status == "complete" else 1
+
+    return {
+        "file_name": file_name,
+        "estimate_date": estimate_date,
+        "page": page_num,
+        "major_category": major_category,
+        "no": clean_text(record.get("no", "")),
+        "item_spec": clean_text(record.get("item_spec", "")),
+        "quantity": clean_text(record.get("quantity", "")),
+        "unit": clean_text(record.get("unit", "")),
+        "unit_price": normalize_money_token(record.get("unit_price", "")),
+        "amount": normalize_money_token(record.get("amount", "")),
+        "raw_row": clean_text(record.get("raw_row", "")),
+        "needs_review": needs_review,
+    }
+
+
+def fallback_process_page_by_text(page, file_name: str, estimate_date: str, page_num: int) -> List[Dict]:
+    lines = extract_lines_from_page(page)
+    lines = merge_multiline_details(lines)
+    major_category = detect_major_category(lines)
+
+    rows = []
+    for line in lines:
+        parsed = parse_detail_line(line)
+        if not parsed:
+            continue
+
+        rows.append({
+            "file_name": file_name,
+            "estimate_date": estimate_date,
+            "page": page_num,
+            "major_category": major_category,
+            "no": parsed["no"],
+            "item_spec": parsed["item_spec"],
+            "quantity": parsed["quantity"],
+            "unit": parsed["unit"],
+            "unit_price": parsed["unit_price"],
+            "amount": parsed["amount"],
+            "raw_row": parsed["raw_row"],
+            "needs_review": parsed["needs_review"],
+        })
+
+    return rows
+
+
+def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
+    rows = []
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        estimate_date = extract_estimate_date(pdf)
+        skip_first_page = should_skip_first_page(pdf)
+
+        previous_major_category = ""
+
+        for page_num, page in enumerate(pdf.pages, start=1):
+            if page_num == 1 and skip_first_page:
+                continue
+
+            try:
+                body_rows, boundaries, header_text = extract_page_rows_with_boundaries(page)
+
+                filtered_rows = [row for row in body_rows if not is_poc_noise_row(row, boundaries)]
+                merged_rows = merge_split_rows_for_poc(filtered_rows, boundaries)
+
+                page_records = []
+                for row in merged_rows:
+                    rec = row_words_to_dynamic_record(row, boundaries)
+                    rec["detail_score"] = detail_score(rec)
+                    rec["parse_status"] = classify_record_status(rec)
+                    page_records.append(rec)
+
+                page_lines_for_title = extract_lines_from_page(page)
+                major_category = detect_major_category(page_lines_for_title)
+                if not major_category:
+                    major_category = previous_major_category
+
+                for rec in page_records:
+                    if rec["parse_status"] not in {"complete", "rescued"}:
+                        continue
+
+                    rows.append(parse_record_to_output_row(
+                        rec,
+                        file_name=file_name,
+                        estimate_date=estimate_date,
+                        page_num=page_num,
+                        major_category=major_category,
+                    ))
+
+                if major_category:
+                    previous_major_category = major_category
+
+            except Exception:
+                fallback_rows = fallback_process_page_by_text(
+                    page=page,
+                    file_name=file_name,
+                    estimate_date=estimate_date,
+                    page_num=page_num,
+                )
+                rows.extend(fallback_rows)
+
+    return rows
+
+
+def process_uploaded_file(uploaded_file) -> List[Dict]:
+    all_rows = []
+
+    if uploaded_file.name.lower().endswith(".pdf"):
+        file_bytes = uploaded_file.read()
+        all_rows.extend(process_pdf(uploaded_file.name, file_bytes))
+
+    elif uploaded_file.name.lower().endswith(".zip"):
+        zip_bytes = uploaded_file.read()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for name in z.namelist():
+                if name.lower().endswith(".pdf"):
+                    file_bytes = z.read(name)
+                    all_rows.extend(process_pdf(name, file_bytes))
+
+    return all_rows
+
+
+# ============================================================
+# PoC 検証モード用関数群
+# ============================================================
+
+def list_pdf_names_in_uploaded_file(uploaded_file) -> List[str]:
+    name = uploaded_file.name
+
+    if name.lower().endswith(".pdf"):
+        return [name]
+
+    if name.lower().endswith(".zip"):
+        zip_bytes = uploaded_file.getvalue()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            return sorted([n for n in z.namelist() if n.lower().endswith(".pdf")])
+
+    return []
+
+
+def get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name: str) -> bytes:
+    name = uploaded_file.name
+
+    if name.lower().endswith(".pdf"):
+        if name != pdf_name:
+            raise ValueError(f"指定PDF名が一致しません: {pdf_name}")
+        return uploaded_file.getvalue()
+
+    if name.lower().endswith(".zip"):
+        zip_bytes = uploaded_file.getvalue()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            return z.read(pdf_name)
+
+    raise ValueError("PDFまたはZIPではないファイルです。")
+
+
+def run_single_page_poc(uploaded_file, pdf_name: str, page_num: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Tuple[float, float]], str]:
     pdf_bytes = get_pdf_bytes_from_uploaded_file(uploaded_file, pdf_name)
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -1114,10 +1172,7 @@ def run_single_page_poc(uploaded_file, pdf_name: str, page_num: int) -> Tuple[pd
                 continue
             body_rows.append(row)
 
-        # まずノイズ行を落とす
         filtered_rows = [row for row in body_rows if not is_poc_noise_row(row, boundaries)]
-
-        # 次に分断行を再結合
         merged_rows = merge_split_rows_for_poc(filtered_rows, boundaries)
 
         records = []
