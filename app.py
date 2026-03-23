@@ -49,6 +49,14 @@ DATE_PATTERNS = [
 
 HEADER_KEYWORDS = ["NO.", "項目", "数量", "単位", "単価", "金額"]
 
+NOISE_PATTERNS = [
+    re.compile(r"^PAGE\.?\d*$", re.IGNORECASE),
+    re.compile(r"^PAGE\.\d+$", re.IGNORECASE),
+    re.compile(r"^ESTIMATE$", re.IGNORECASE),
+    re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$"),
+    re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$"),
+]
+
 
 def clean_text(text: str) -> str:
     text = str(text or "")
@@ -56,6 +64,7 @@ def clean_text(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
 
 
 def normalize_date_str(text: str) -> str:
@@ -66,6 +75,7 @@ def normalize_date_str(text: str) -> str:
             y, mth, d = m.groups()
             return f"{y}-{int(mth):02d}-{int(d):02d}"
     return ""
+
 
 
 def extract_estimate_date(pdf) -> str:
@@ -90,6 +100,7 @@ def extract_estimate_date(pdf) -> str:
     return candidates[0] if candidates else ""
 
 
+
 def normalize_money_token(text: str) -> str:
     t = clean_text(text)
     if not t:
@@ -105,13 +116,16 @@ def normalize_money_token(text: str) -> str:
     return t
 
 
+
 def row_to_text(row_words: List[Dict]) -> str:
     return clean_text(" ".join(w["text"] for w in sorted(row_words, key=lambda x: x["x0"])))
+
 
 
 def is_header_text(text: str) -> bool:
     score = sum(1 for k in HEADER_KEYWORDS if k in text)
     return score >= 4
+
 
 
 def is_summary_row(text: str) -> bool:
@@ -125,6 +139,7 @@ def is_summary_row(text: str) -> bool:
     if re.match(r"^PAGE\.", t, flags=re.IGNORECASE):
         return True
     return False
+
 
 
 def extract_all_words(page) -> List[Dict]:
@@ -150,33 +165,38 @@ def extract_all_words(page) -> List[Dict]:
     return results
 
 
-def group_words_by_row(words: List[Dict], tolerance: float = 3.0) -> List[List[Dict]]:
+
+def group_words_by_row(words: List[Dict], tolerance: float = 4.0) -> List[List[Dict]]:
     if not words:
         return []
 
-    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+    words = sorted(words, key=lambda w: (((w["top"] + w["bottom"]) / 2), w["x0"]))
 
     rows = []
     current = []
-    current_top = None
+    current_center = None
 
     for w in words:
-        if current_top is None:
+        center = (w["top"] + w["bottom"]) / 2
+
+        if current_center is None:
             current = [w]
-            current_top = w["top"]
+            current_center = center
             continue
 
-        if abs(w["top"] - current_top) <= tolerance:
+        if abs(center - current_center) <= tolerance:
             current.append(w)
+            current_center = sum((x["top"] + x["bottom"]) / 2 for x in current) / len(current)
         else:
             rows.append(sorted(current, key=lambda x: x["x0"]))
             current = [w]
-            current_top = w["top"]
+            current_center = center
 
     if current:
         rows.append(sorted(current, key=lambda x: x["x0"]))
 
     return rows
+
 
 
 def find_header_row(rows: List[List[Dict]]) -> Optional[List[Dict]]:
@@ -187,11 +207,13 @@ def find_header_row(rows: List[List[Dict]]) -> Optional[List[Dict]]:
     return None
 
 
+
 def get_header_pos(header_row: List[Dict], keyword: str) -> Tuple[Optional[float], Optional[float]]:
     for w in header_row:
         if keyword in w["text"]:
             return w["x0"], w["x1"]
     return None, None
+
 
 
 def build_column_boundaries(header_row: List[Dict], table_x_max: float) -> Dict[str, Tuple[float, float]]:
@@ -221,12 +243,39 @@ def build_column_boundaries(header_row: List[Dict], table_x_max: float) -> Dict[
     }
 
 
+
 def assign_word_to_column(word: Dict, boundaries: Dict[str, Tuple[float, float]]) -> Optional[str]:
     center_x = (word["x0"] + word["x1"]) / 2
     for col, (x_min, x_max) in boundaries.items():
         if x_min <= center_x < x_max:
             return col
     return None
+
+
+
+def is_number_like_token(text: str) -> bool:
+    t = normalize_money_token(text)
+    t = t.replace(",", "")
+    return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", t))
+
+
+
+def apply_right_edge_fallback(rec: Dict, row_words: List[Dict]) -> Dict:
+    numeric_words = [w for w in sorted(row_words, key=lambda x: x["x0"]) if is_number_like_token(w["text"])]
+    if not numeric_words:
+        return rec
+
+    tail = [w["text"] for w in numeric_words[-3:]]
+
+    if not rec["amount"] and len(tail) >= 1:
+        rec["amount"] = tail[-1]
+    if not rec["unit_price"] and len(tail) >= 2:
+        rec["unit_price"] = tail[-2]
+    if not rec["quantity"] and len(tail) >= 3:
+        rec["quantity"] = tail[-3]
+
+    return rec
+
 
 
 def row_to_record(row_words: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> Dict:
@@ -244,7 +293,7 @@ def row_to_record(row_words: List[Dict], boundaries: Dict[str, Tuple[float, floa
         if col is not None:
             buckets[col].append(w["text"])
 
-    return {
+    rec = {
         "no": clean_text(" ".join(buckets["no"])),
         "item_spec": clean_text(" ".join(buckets["item_spec"])),
         "quantity": clean_text(" ".join(buckets["quantity"])),
@@ -254,6 +303,9 @@ def row_to_record(row_words: List[Dict], boundaries: Dict[str, Tuple[float, floa
         "raw_row": row_to_text(row_words),
         "row_words": row_words,
     }
+
+    return apply_right_edge_fallback(rec, row_words)
+
 
 
 def should_merge_records(cur: Dict, nxt: Dict) -> bool:
@@ -275,35 +327,27 @@ def should_merge_records(cur: Dict, nxt: Dict) -> bool:
     return True
 
 
+
 def merge_two_records(cur: Dict, nxt: Dict, boundaries: Dict[str, Tuple[float, float]]) -> Dict:
     merged_words = sorted(cur["row_words"] + nxt["row_words"], key=lambda x: (x["top"], x["x0"]))
     return row_to_record(merged_words, boundaries)
 
 
+
 def merge_split_rows(records: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> List[Dict]:
-    merged = []
-    i = 0
+    # 現行様式では「1行=1工種」を優先し、行結合は停止。
+    return records
 
-    while i < len(records):
-        cur = records[i]
-        if i + 1 < len(records):
-            nxt = records[i + 1]
-            if should_merge_records(cur, nxt):
-                merged.append(merge_two_records(cur, nxt, boundaries))
-                i += 2
-                continue
-        merged.append(cur)
-        i += 1
-
-    return merged
 
 
 def is_adopted_record(rec: Dict) -> bool:
     return bool(
+        clean_text(rec["quantity"]) or
         clean_text(rec["unit"]) or
         clean_text(rec["unit_price"]) or
         clean_text(rec["amount"])
     )
+
 
 
 def detect_major_category_from_page_text(page) -> str:
@@ -312,12 +356,35 @@ def detect_major_category_from_page_text(page) -> str:
     # 後で別ロジックに差し替える前提で空文字を返す。
     return ""
 
-    upper_lines = lines[:header_idx]
-    for line in reversed(upper_lines):
-        if len(line) <= 40 and not re.search(r"[¥￥]", line) and not re.search(r"見積|株式会社|TEL|FAX|〒", line):
-            return line
 
-    return ""
+
+def get_candidate_horizontal_lines(page) -> List[Dict]:
+    candidates = []
+
+    for ln in getattr(page, "lines", []):
+        x0 = float(ln["x0"])
+        x1 = float(ln["x1"])
+        top = float(ln["top"])
+        bottom = float(ln["bottom"])
+        if abs(bottom - top) <= 1.5 and (x1 - x0) >= 80:
+            candidates.append({
+                "y": (top + bottom) / 2,
+                "x0": x0,
+                "x1": x1,
+                "width": x1 - x0,
+            })
+
+    for rc in getattr(page, "rects", []):
+        x0 = float(rc["x0"])
+        x1 = float(rc["x1"])
+        top = float(rc["top"])
+        bottom = float(rc["bottom"])
+        if (x1 - x0) >= 80:
+            candidates.append({"y": top, "x0": x0, "x1": x1, "width": x1 - x0})
+            candidates.append({"y": bottom, "x0": x0, "x1": x1, "width": x1 - x0})
+
+    return candidates
+
 
 
 def get_candidate_vertical_lines(page) -> List[Dict]:
@@ -361,6 +428,7 @@ def get_candidate_vertical_lines(page) -> List[Dict]:
     return candidates
 
 
+
 def cluster_x_positions(xs: List[float], tolerance: float = 2.5) -> List[float]:
     if not xs:
         return []
@@ -375,6 +443,7 @@ def cluster_x_positions(xs: List[float], tolerance: float = 2.5) -> List[float]:
             groups.append([x])
 
     return [sum(g) / len(g) for g in groups]
+
 
 
 def detect_table_region_from_lines(page, header_row: List[Dict]) -> Optional[Dict]:
@@ -400,17 +469,29 @@ def detect_table_region_from_lines(page, header_row: List[Dict]) -> Optional[Dic
 
     x_min = min(clustered)
     x_max = max(clustered)
-    body_bottoms = [ln["bottom"] for ln in usable]
+
+    hlines = get_candidate_horizontal_lines(page)
+    row_lines = []
+    for ln in hlines:
+        crosses_table = ln["x0"] <= x_min + 10 and ln["x1"] >= x_max - 10
+        if crosses_table and ln["y"] >= header_bottom - 2:
+            row_lines.append(ln["y"])
+
+    body_bottom = max(ln["bottom"] for ln in usable)
+    if row_lines:
+        row_lines = sorted(row_lines)
+        body_bottom = row_lines[-1] + 2
 
     return {
         "x_min": x_min - 2,
         "x_max": x_max + 2,
         "header_top": header_top,
         "body_top": header_bottom,
-        "body_bottom": max(body_bottoms),
+        "body_bottom": body_bottom,
         "method": "lines",
         "line_count": len(usable),
     }
+
 
 
 def detect_table_region_from_header(page, header_row: List[Dict]) -> Dict:
@@ -431,6 +512,7 @@ def detect_table_region_from_header(page, header_row: List[Dict]) -> Dict:
     }
 
 
+
 def detect_table_region(page, rows: List[List[Dict]], header_row: List[Dict]) -> Dict:
     region = detect_table_region_from_lines(page, header_row)
     if region is not None:
@@ -438,16 +520,52 @@ def detect_table_region(page, rows: List[List[Dict]], header_row: List[Dict]) ->
     return detect_table_region_from_header(page, header_row)
 
 
+
+def is_noise_word(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return True
+    return any(p.fullmatch(t) for p in NOISE_PATTERNS)
+
+
+
 def filter_words_in_region(words: List[Dict], region: Dict) -> List[Dict]:
     filtered = []
+    right_noise_x = region["x_max"] - 80
+
     for w in words:
         cx = (w["x0"] + w["x1"]) / 2
         cy = (w["top"] + w["bottom"]) / 2
+        text = clean_text(w["text"])
 
-        if region["x_min"] <= cx <= region["x_max"] and region["body_top"] <= cy <= region["body_bottom"]:
-            filtered.append(w)
+        if not (region["x_min"] <= cx <= region["x_max"] and region["body_top"] <= cy <= region["body_bottom"]):
+            continue
+
+        if cx >= right_noise_x and is_noise_word(text):
+            continue
+
+        filtered.append(w)
 
     return filtered
+
+
+
+def is_index_like_page(page_num: int, records: List[Dict]) -> bool:
+    if not records:
+        return True
+
+    adopted_count = sum(1 for r in records if is_adopted_record(r))
+    adopted_rate = adopted_count / max(len(records), 1)
+    no_count = sum(1 for r in records if clean_text(r["no"]))
+    amount_count = sum(1 for r in records if clean_text(r["amount"]))
+
+    if page_num == 1 and adopted_rate < 0.35:
+        return True
+    if page_num == 1 and amount_count <= 2 and no_count >= 5:
+        return True
+
+    return False
+
 
 
 def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
@@ -481,6 +599,9 @@ def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
                 boundaries = build_column_boundaries(header_row, table_x_max=region["x_max"])
                 records = [row_to_record(r, boundaries) for r in body_rows]
                 records = merge_split_rows(records, boundaries)
+
+                if is_index_like_page(page_num, records):
+                    continue
 
                 major_category = detect_major_category_from_page_text(page)
 
@@ -518,6 +639,7 @@ def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
                 })
 
     return output_rows
+
 
 
 def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dict]:
@@ -564,10 +686,18 @@ def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dic
                 region = detect_table_region(page, all_rows, header_row)
                 region_words = filter_words_in_region(all_words, region)
 
+                records = []
+                if region_words:
+                    body_rows = group_words_by_row(region_words)
+                    body_rows = [r for r in body_rows if not is_header_text(row_to_text(r))]
+                    body_rows = [r for r in body_rows if not is_summary_row(row_to_text(r))]
+                    boundaries = build_column_boundaries(header_row, table_x_max=region["x_max"])
+                    records = [row_to_record(r, boundaries) for r in body_rows]
+
                 debug_rows.append({
                     "file_name": file_name,
                     "page": page_num,
-                    "status": "ok",
+                    "status": "index_like" if is_index_like_page(page_num, records) else "ok",
                     "region_method": region.get("method", ""),
                     "x_min": round(region.get("x_min", 0), 1),
                     "x_max": round(region.get("x_max", 0), 1),
@@ -595,6 +725,7 @@ def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dic
     return debug_rows
 
 
+
 def process_uploaded_file(uploaded_file) -> List[Dict]:
     rows = []
 
@@ -611,6 +742,7 @@ def process_uploaded_file(uploaded_file) -> List[Dict]:
     return rows
 
 
+
 def make_excel_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=EXCEL_COLUMNS)
@@ -622,12 +754,14 @@ def make_excel_df(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = ""
 
     out = out[
+        out["quantity"].astype(str).str.strip().ne("") |
         out["unit"].astype(str).str.strip().ne("") |
         out["unit_price"].astype(str).str.strip().ne("") |
         out["amount"].astype(str).str.strip().ne("")
     ].copy()
 
     return out[EXCEL_COLUMNS].fillna("")
+
 
 
 def render_excel_copy_button(df_for_copy: pd.DataFrame, label: str = "Excel用コピー"):
