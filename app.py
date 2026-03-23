@@ -307,17 +307,10 @@ def is_adopted_record(rec: Dict) -> bool:
 
 
 def detect_major_category_from_page_text(page) -> str:
-    text = page.extract_text() or ""
-    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
-
-    header_idx = None
-    for i, line in enumerate(lines):
-        if is_header_text(line):
-            header_idx = i
-            break
-
-    if header_idx is None:
-        return ""
+    # 大分類抽出は一旦停止。
+    # 現状は PAGE / 日付 / ESTIMATE などの誤認が多いため、
+    # 後で別ロジックに差し替える前提で空文字を返す。
+    return ""
 
     upper_lines = lines[:header_idx]
     for line in reversed(upper_lines):
@@ -330,7 +323,6 @@ def detect_major_category_from_page_text(page) -> str:
 def get_candidate_vertical_lines(page) -> List[Dict]:
     candidates = []
 
-    # page.lines
     for ln in getattr(page, "lines", []):
         x0 = float(ln["x0"])
         x1 = float(ln["x1"])
@@ -345,7 +337,6 @@ def get_candidate_vertical_lines(page) -> List[Dict]:
                 "source": "line",
             })
 
-    # page.rects の左右辺
     for rc in getattr(page, "rects", []):
         x0 = float(rc["x0"])
         x1 = float(rc["x1"])
@@ -409,8 +400,6 @@ def detect_table_region_from_lines(page, header_row: List[Dict]) -> Optional[Dic
 
     x_min = min(clustered)
     x_max = max(clustered)
-
-    body_tops = [ln["top"] for ln in usable]
     body_bottoms = [ln["bottom"] for ln in usable]
 
     return {
@@ -486,7 +475,6 @@ def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
                 if not body_rows:
                     continue
 
-                # ヘッダー行を除外
                 body_rows = [r for r in body_rows if not is_header_text(row_to_text(r))]
                 body_rows = [r for r in body_rows if not is_summary_row(row_to_text(r))]
 
@@ -530,6 +518,81 @@ def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
                 })
 
     return output_rows
+
+
+def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dict]:
+    debug_rows = []
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            try:
+                all_words = extract_all_words(page)
+                all_rows = group_words_by_row(all_words)
+                if not all_rows:
+                    debug_rows.append({
+                        "file_name": file_name,
+                        "page": page_num,
+                        "status": "no_rows",
+                        "region_method": "",
+                        "x_min": "",
+                        "x_max": "",
+                        "body_top": "",
+                        "body_bottom": "",
+                        "all_words": 0,
+                        "region_words": 0,
+                        "header_text": "",
+                    })
+                    continue
+
+                header_row = find_header_row(all_rows)
+                if header_row is None:
+                    debug_rows.append({
+                        "file_name": file_name,
+                        "page": page_num,
+                        "status": "no_header",
+                        "region_method": "",
+                        "x_min": "",
+                        "x_max": "",
+                        "body_top": "",
+                        "body_bottom": "",
+                        "all_words": len(all_words),
+                        "region_words": 0,
+                        "header_text": "",
+                    })
+                    continue
+
+                region = detect_table_region(page, all_rows, header_row)
+                region_words = filter_words_in_region(all_words, region)
+
+                debug_rows.append({
+                    "file_name": file_name,
+                    "page": page_num,
+                    "status": "ok",
+                    "region_method": region.get("method", ""),
+                    "x_min": round(region.get("x_min", 0), 1),
+                    "x_max": round(region.get("x_max", 0), 1),
+                    "body_top": round(region.get("body_top", 0), 1),
+                    "body_bottom": round(region.get("body_bottom", 0), 1),
+                    "all_words": len(all_words),
+                    "region_words": len(region_words),
+                    "header_text": row_to_text(header_row),
+                })
+            except Exception as e:
+                debug_rows.append({
+                    "file_name": file_name,
+                    "page": page_num,
+                    "status": f"error: {e}",
+                    "region_method": "",
+                    "x_min": "",
+                    "x_max": "",
+                    "body_top": "",
+                    "body_bottom": "",
+                    "all_words": "",
+                    "region_words": "",
+                    "header_text": "",
+                })
+
+    return debug_rows
 
 
 def process_uploaded_file(uploaded_file) -> List[Dict]:
@@ -615,17 +678,35 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+debug_region = st.checkbox("表領域デバッグを表示", value=True)
+
 if uploaded_files:
     all_rows = []
+    debug_rows = []
 
     for uploaded_file in uploaded_files:
         all_rows.extend(process_uploaded_file(uploaded_file))
+
+        if debug_region:
+            if uploaded_file.name.lower().endswith(".pdf"):
+                debug_rows.extend(build_debug_table_region_rows(uploaded_file.name, uploaded_file.getvalue()))
+            elif uploaded_file.name.lower().endswith(".zip"):
+                zip_bytes = uploaded_file.getvalue()
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                    for name in z.namelist():
+                        if name.lower().endswith(".pdf"):
+                            debug_rows.extend(build_debug_table_region_rows(name, z.read(name)))
 
     df = pd.DataFrame(all_rows, columns=OUTPUT_COLUMNS)
 
     st.subheader("抽出結果")
     st.write(f"抽出行数: {len(df):,}")
     st.dataframe(df, use_container_width=True, height=500)
+
+    if debug_region:
+        debug_df = pd.DataFrame(debug_rows)
+        st.subheader("表領域デバッグ")
+        st.dataframe(debug_df, use_container_width=True, height=300)
 
     excel_df = make_excel_df(df)
 
