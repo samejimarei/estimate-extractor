@@ -49,12 +49,13 @@ DATE_PATTERNS = [
 
 HEADER_KEYWORDS = ["NO.", "項目", "数量", "単位", "単価", "金額"]
 
-NOISE_PATTERNS = [
+MAJOR_CATEGORY_NOISE_PATTERNS = [
     re.compile(r"^PAGE\.?\d*$", re.IGNORECASE),
     re.compile(r"^PAGE\.\d+$", re.IGNORECASE),
     re.compile(r"^ESTIMATE$", re.IGNORECASE),
     re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$"),
     re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$"),
+    re.compile(r"^\d+$"),
 ]
 
 
@@ -254,15 +255,14 @@ def assign_word_to_column(word: Dict, boundaries: Dict[str, Tuple[float, float]]
 
 
 def is_number_like_token(text: str) -> bool:
-    t = normalize_money_token(text)
-    t = t.replace(",", "")
+    t = normalize_money_token(text).replace(",", "")
     return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", t))
 
 
 
 def apply_right_edge_fallback(rec: Dict, row_words: List[Dict]) -> Dict:
     numeric_words = [w for w in sorted(row_words, key=lambda x: x["x0"]) if is_number_like_token(w["text"])]
-    if not numeric_words:
+    if len(numeric_words) < 2:
         return rec
 
     tail = [w["text"] for w in numeric_words[-3:]]
@@ -308,53 +308,56 @@ def row_to_record(row_words: List[Dict], boundaries: Dict[str, Tuple[float, floa
 
 
 
-def should_merge_records(cur: Dict, nxt: Dict) -> bool:
-    cur_has_head = bool(clean_text(cur["no"]) or clean_text(cur["item_spec"]))
-    cur_has_tail = bool(clean_text(cur["quantity"]) or clean_text(cur["unit"]) or clean_text(cur["unit_price"]) or clean_text(cur["amount"]))
-
-    nxt_has_no = bool(clean_text(nxt["no"]))
-    nxt_has_tail = bool(clean_text(nxt["quantity"]) or clean_text(nxt["unit"]) or clean_text(nxt["unit_price"]) or clean_text(nxt["amount"]))
-
-    if not cur_has_head:
-        return False
-    if cur_has_tail:
-        return False
-    if nxt_has_no:
-        return False
-    if not nxt_has_tail:
-        return False
-
-    return True
-
-
-
-def merge_two_records(cur: Dict, nxt: Dict, boundaries: Dict[str, Tuple[float, float]]) -> Dict:
-    merged_words = sorted(cur["row_words"] + nxt["row_words"], key=lambda x: (x["top"], x["x0"]))
-    return row_to_record(merged_words, boundaries)
-
-
-
 def merge_split_rows(records: List[Dict], boundaries: Dict[str, Tuple[float, float]]) -> List[Dict]:
-    # 現行様式では「1行=1工種」を優先し、行結合は停止。
     return records
 
 
 
+def is_placeholder_number_row(rec: Dict) -> bool:
+    no = clean_text(rec["no"])
+    item_spec = clean_text(rec["item_spec"])
+    quantity = clean_text(rec["quantity"])
+    unit = clean_text(rec["unit"])
+    unit_price = clean_text(rec["unit_price"])
+    amount = clean_text(rec["amount"])
+    raw_row = clean_text(rec["raw_row"])
+
+    if not no or item_spec or quantity or unit or unit_price:
+        return False
+    if raw_row == no:
+        return True
+    if amount and amount == no:
+        return True
+    return False
+
+
+
+def count_numeric_fields(rec: Dict) -> int:
+    count = 0
+    if clean_text(rec["quantity"]):
+        count += 1
+    if clean_text(rec["unit_price"]):
+        count += 1
+    if clean_text(rec["amount"]):
+        count += 1
+    return count
+
+
+
 def is_adopted_record(rec: Dict) -> bool:
-    return bool(
-        clean_text(rec["quantity"]) or
-        clean_text(rec["unit"]) or
-        clean_text(rec["unit_price"]) or
-        clean_text(rec["amount"])
-    )
+    if is_placeholder_number_row(rec):
+        return False
 
+    amount = clean_text(rec["amount"])
+    numeric_count = count_numeric_fields(rec)
+    unit = clean_text(rec["unit"])
+    item_spec = clean_text(rec["item_spec"])
 
-
-def detect_major_category_from_page_text(page) -> str:
-    # 大分類抽出は一旦停止。
-    # 現状は PAGE / 日付 / ESTIMATE などの誤認が多いため、
-    # 後で別ロジックに差し替える前提で空文字を返す。
-    return ""
+    if amount and (numeric_count >= 2 or (unit and item_spec)):
+        return True
+    if numeric_count >= 3:
+        return True
+    return False
 
 
 
@@ -521,49 +524,81 @@ def detect_table_region(page, rows: List[List[Dict]], header_row: List[Dict]) ->
 
 
 
-def is_noise_word(text: str) -> bool:
-    t = clean_text(text)
-    if not t:
-        return True
-    return any(p.fullmatch(t) for p in NOISE_PATTERNS)
-
-
-
 def filter_words_in_region(words: List[Dict], region: Dict) -> List[Dict]:
     filtered = []
-    right_noise_x = region["x_max"] - 80
-
     for w in words:
         cx = (w["x0"] + w["x1"]) / 2
         cy = (w["top"] + w["bottom"]) / 2
-        text = clean_text(w["text"])
 
-        if not (region["x_min"] <= cx <= region["x_max"] and region["body_top"] <= cy <= region["body_bottom"]):
-            continue
-
-        if cx >= right_noise_x and is_noise_word(text):
-            continue
-
-        filtered.append(w)
+        if region["x_min"] <= cx <= region["x_max"] and region["body_top"] <= cy <= region["body_bottom"]:
+            filtered.append(w)
 
     return filtered
 
 
 
+def looks_like_major_category(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+    if len(t) > 24:
+        return False
+    if normalize_date_str(t):
+        return False
+    if any(p.fullmatch(t) for p in MAJOR_CATEGORY_NOISE_PATTERNS):
+        return False
+    if re.search(r"PAGE|ESTIMATE", t, flags=re.IGNORECASE):
+        return False
+    if re.fullmatch(r"[A-Za-z0-9./:-]+", t):
+        return False
+    return True
+
+
+
+def detect_major_category_outside_table(page, all_words: List[Dict], region: Dict) -> str:
+    page_left_limit = page.width * 0.45
+    top_limit = region["header_top"] - 2
+
+    candidates = []
+    for w in all_words:
+        text = clean_text(w["text"])
+        if not text:
+            continue
+        if w["x0"] > page_left_limit:
+            continue
+        if w["bottom"] > top_limit:
+            continue
+        if region["x_min"] <= ((w["x0"] + w["x1"]) / 2) <= region["x_max"]:
+            continue
+        if not looks_like_major_category(text):
+            continue
+        candidates.append(w)
+
+    if not candidates:
+        return ""
+
+    rows = group_words_by_row(candidates, tolerance=4.0)
+    row_texts = [row_to_text(r) for r in rows if looks_like_major_category(row_to_text(r))]
+    if not row_texts:
+        return ""
+
+    row_texts = sorted(row_texts, key=lambda t: (len(t), t))
+    return row_texts[0]
+
+
+
 def is_index_like_page(page_num: int, records: List[Dict]) -> bool:
+    if page_num == 1:
+        return True
     if not records:
         return True
 
     adopted_count = sum(1 for r in records if is_adopted_record(r))
     adopted_rate = adopted_count / max(len(records), 1)
-    no_count = sum(1 for r in records if clean_text(r["no"]))
     amount_count = sum(1 for r in records if clean_text(r["amount"]))
 
-    if page_num == 1 and adopted_rate < 0.35:
+    if adopted_rate < 0.25 and amount_count <= 2:
         return True
-    if page_num == 1 and amount_count <= 2 and no_count >= 5:
-        return True
-
     return False
 
 
@@ -587,23 +622,20 @@ def process_pdf(file_name: str, file_bytes: bytes) -> List[Dict]:
                     continue
 
                 region = detect_table_region(page, all_rows, header_row)
+                boundaries = build_column_boundaries(header_row, table_x_max=region["x_max"])
+
                 region_words = filter_words_in_region(all_words, region)
                 body_rows = group_words_by_row(region_words)
-
-                if not body_rows:
-                    continue
-
                 body_rows = [r for r in body_rows if not is_header_text(row_to_text(r))]
                 body_rows = [r for r in body_rows if not is_summary_row(row_to_text(r))]
 
-                boundaries = build_column_boundaries(header_row, table_x_max=region["x_max"])
                 records = [row_to_record(r, boundaries) for r in body_rows]
                 records = merge_split_rows(records, boundaries)
 
                 if is_index_like_page(page_num, records):
                     continue
 
-                major_category = detect_major_category_from_page_text(page)
+                major_category = detect_major_category_outside_table(page, all_words, region)
 
                 for rec in records:
                     if not is_adopted_record(rec):
@@ -663,6 +695,7 @@ def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dic
                         "all_words": 0,
                         "region_words": 0,
                         "header_text": "",
+                        "major_category": "",
                     })
                     continue
 
@@ -680,19 +713,17 @@ def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dic
                         "all_words": len(all_words),
                         "region_words": 0,
                         "header_text": "",
+                        "major_category": "",
                     })
                     continue
 
                 region = detect_table_region(page, all_rows, header_row)
+                boundaries = build_column_boundaries(header_row, table_x_max=region["x_max"])
                 region_words = filter_words_in_region(all_words, region)
-
-                records = []
-                if region_words:
-                    body_rows = group_words_by_row(region_words)
-                    body_rows = [r for r in body_rows if not is_header_text(row_to_text(r))]
-                    body_rows = [r for r in body_rows if not is_summary_row(row_to_text(r))]
-                    boundaries = build_column_boundaries(header_row, table_x_max=region["x_max"])
-                    records = [row_to_record(r, boundaries) for r in body_rows]
+                body_rows = group_words_by_row(region_words)
+                body_rows = [r for r in body_rows if not is_header_text(row_to_text(r))]
+                body_rows = [r for r in body_rows if not is_summary_row(row_to_text(r))]
+                records = [row_to_record(r, boundaries) for r in body_rows]
 
                 debug_rows.append({
                     "file_name": file_name,
@@ -706,6 +737,7 @@ def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dic
                     "all_words": len(all_words),
                     "region_words": len(region_words),
                     "header_text": row_to_text(header_row),
+                    "major_category": detect_major_category_outside_table(page, all_words, region),
                 })
             except Exception as e:
                 debug_rows.append({
@@ -720,6 +752,7 @@ def build_debug_table_region_rows(file_name: str, file_bytes: bytes) -> List[Dic
                     "all_words": "",
                     "region_words": "",
                     "header_text": "",
+                    "major_category": "",
                 })
 
     return debug_rows
